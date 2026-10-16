@@ -119,11 +119,37 @@ cargo build --release
 # 产物：target\release\screenrec.exe
 ```
 
+图标由 `build.rs` 嵌入 exe，需要 Windows SDK 的 `rc.exe`；没有时构建照常成功，只是 exe 无文件图标。
+
 可选：把 FFmpeg 下载到仓库内（自动被识别）：
 
 ```powershell
 node scripts\fetch-ffmpeg.mjs
 ```
+
+### 3.3 应用图标
+
+图标是**用代码画出来的**，仓库里不放二进制美术资源（只有生成结果），改完可以重新生成：
+
+```powershell
+cargo run --release --example make_icon
+# assets/icon.png（512x512，窗口图标）
+# assets/icon.ico（16/24/32/48/64/128/256，可执行文件图标）
+# assets/icon_32_preview.png（32px 预览，用于检查任务栏尺寸下是否清晰）
+```
+
+画法：每种尺寸都按 4 倍分辨率绘制再做盒平均下采样，因此边缘是抗锯齿的；
+图形是圆角深色底板 + 显示器轮廓 + 红色录制圆点（16px 下只剩底板和红点，仍能辨认）。
+
+图标有两个落点：
+
+| 用途 | 做法 |
+| --- | --- |
+| 运行时的窗口/任务栏图标 | `assets/icon.png` 由 `include_bytes!` 编进程序，启动时解码成 egui 图标 |
+| 资源管理器里的文件图标 | `assets/icon.rc` + `build.rs` 调用 Windows SDK 的 `rc.exe` 编译 `icon.ico`，把 `.res` 交给链接器 |
+
+`build.rs` **直接调用 rc.exe，不引入额外依赖**；找不到 rc.exe（没装 Windows SDK）时只打印
+一条警告并跳过，不会让构建失败——只是 exe 没有文件图标。
 
 ---
 
@@ -315,9 +341,15 @@ src/
     ring.rs          有界采样环形缓冲
   gui/
     mod.rs, app.rs, theme.rs, widgets.rs   图形界面（录制 / 记录 / 设置 / 关于）
+build.rs             把应用图标编译进 exe（找不到 rc.exe 时降级为警告）
+assets/
+  icon.png           窗口图标（make_icon 生成）
+  icon.ico           可执行文件图标，7 种尺寸（make_icon 生成）
+  icon.rc            图标资源脚本
 examples/
   dxgi_probe.rs      DXGI 像素格式/内容诊断工具
   perf.rs            逐帧 CPU 开销基准（HDR 转换、缩放、裁剪、整条管线）
+  make_icon.rs       绘制并导出应用图标（含 ICO 写出与回读自检）
 scripts/
   env.ps1           仓库本地 Rust 环境
   cargo.ps1         cargo 包装脚本

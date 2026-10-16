@@ -21,3 +21,6 @@
 *.swp
 Thumbs.db
 desktop.ini
+
+# Icon generation debug output (assets/icon.png and icon.ico are committed)
+/assets/icon_32_preview.png
