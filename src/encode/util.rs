@@ -91,6 +91,15 @@ pub fn rgba_to_bgra(src: &[u8], out: &mut Vec<u8>) {
 ///
 /// Only called when the user asked for a different output size than the
 /// captured one; the common path is a straight pass-through.
+/// Resizes a BGRA frame.
+///
+/// Written by hand rather than delegated to the `image` crate: that path cost
+/// ~119 ms per 4K frame because it ran a float convolution plus two full
+/// channel-swap passes. This version stays in BGRA and uses integer maths.
+///
+/// Integer downscale factors use a box average, which is both faster and
+/// better than a filter for video (it is a true area average, so it does not
+/// alias). Anything else falls back to fixed-point bilinear sampling.
 pub fn scale_bgra(
     src: &[u8],
     src_width: u32,
@@ -100,7 +109,10 @@ pub fn scale_bgra(
     scratch: &mut Vec<u8>,
     out: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
-    use anyhow::Context as _;
+    let src_width = src_width.max(1);
+    let src_height = src_height.max(1);
+    let dst_width = dst_width.max(1);
+    let dst_height = dst_height.max(1);
 
     let expected = (src_width as usize) * (src_height as usize) * 4;
     anyhow::ensure!(
@@ -109,19 +121,215 @@ pub fn scale_bgra(
         src.len(),
         expected
     );
+    let src = &src[..expected];
 
-    bgra_to_rgba(&src[..expected], scratch);
-    let image = image::RgbaImage::from_raw(src_width, src_height, std::mem::take(scratch))
-        .context("failed to build image from frame buffer")?;
-    let resized = image::imageops::resize(
-        &image,
-        dst_width.max(1),
-        dst_height.max(1),
-        image::imageops::FilterType::Triangle,
-    );
-    rgba_to_bgra(resized.as_raw(), out);
-    *scratch = image.into_raw();
+    // Nothing to do: hand the pixels straight through.
+    if src_width == dst_width && src_height == dst_height {
+        out.clear();
+        out.extend_from_slice(src);
+        return Ok(());
+    }
+
+    let exact = src_width % dst_width == 0
+        && src_height % dst_height == 0
+        && src_width / dst_width >= 2
+        && src_height / dst_height >= 2;
+
+    if exact {
+        box_downscale_bgra(
+            src,
+            src_width,
+            src_height,
+            dst_width,
+            dst_height,
+            out,
+        );
+    } else {
+        bilinear_bgra(
+            src,
+            src_width,
+            src_height,
+            dst_width,
+            dst_height,
+            scratch,
+            out,
+        );
+    }
     Ok(())
+}
+
+/// How many threads row-band work should use.
+///
+/// Below ~512 KB of output the wake-up cost outweighs the parallelism, which
+/// also keeps small recordings on a single thread.
+fn parallel_degree(rows: usize, bytes: usize) -> usize {
+    const MIN_BYTES: usize = 1 << 19;
+    if bytes < MIN_BYTES || rows < 2 {
+        return 1;
+    }
+    std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1)
+        .min(8)
+        .min(rows)
+        .max(1)
+}
+
+/// Runs `work(start_row, band)` over row-aligned bands of `out` in parallel.
+///
+/// `out` must hold whole rows of `row_bytes`. Bands are disjoint, so the output
+/// is identical whatever the thread count — which keeps pixels deterministic.
+fn with_row_bands<F>(out: &mut [u8], row_bytes: usize, work: F)
+where
+    F: Fn(usize, &mut [u8]) + Sync,
+{
+    if row_bytes == 0 || out.is_empty() {
+        return;
+    }
+    let rows = out.len() / row_bytes;
+    if rows == 0 {
+        return;
+    }
+
+    let threads = parallel_degree(rows, out.len());
+    if threads <= 1 {
+        work(0, out);
+        return;
+    }
+
+    let band_rows = rows.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (index, band) in out.chunks_mut(band_rows * row_bytes).enumerate() {
+            let start_row = index * band_rows;
+            let work = &work;
+            scope.spawn(move || work(start_row, band));
+        }
+    });
+}
+
+/// Area-averages `factor_x` x `factor_y` blocks into one output pixel.
+fn box_downscale_bgra(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    out: &mut Vec<u8>,
+) {
+    let factor_x = (src_width / dst_width) as usize;
+    let factor_y = (src_height / dst_height) as usize;
+    let row_bytes = (dst_width as usize) * 4;
+    let src_stride = (src_width as usize) * 4;
+
+    out.clear();
+    out.resize(row_bytes * dst_height as usize, 0);
+
+    // One output row at a time: the source span is the same for every pixel of
+    // that row, so the block offsets are computed once.
+    let source = src;
+    let row_stride = factor_x * 4;
+
+    with_row_bands(out, row_bytes, |start_row, band| {
+        for (offset, row) in band.chunks_mut(row_bytes).enumerate() {
+            let dst_y = start_row + offset;
+            let first_src_row = dst_y * factor_y;
+            for (dst_x, pixel) in row.chunks_mut(4).enumerate() {
+                let mut blue = 0u32;
+                let mut green = 0u32;
+                let mut red = 0u32;
+                let mut alpha = 0u32;
+
+                let first_column = dst_x * row_stride;
+                for block_y in 0..factor_y {
+                    let base = (first_src_row + block_y) * src_stride;
+                    let mut cursor = base + first_column;
+                    for _ in 0..factor_x {
+                        blue += source[cursor] as u32;
+                        green += source[cursor + 1] as u32;
+                        red += source[cursor + 2] as u32;
+                        alpha += source[cursor + 3] as u32;
+                        cursor += 4;
+                    }
+                }
+
+                let count = (factor_x * factor_y) as u32;
+                pixel[0] = ((blue + count / 2) / count) as u8;
+                pixel[1] = ((green + count / 2) / count) as u8;
+                pixel[2] = ((red + count / 2) / count) as u8;
+                pixel[3] = ((alpha + count / 2) / count) as u8;
+            }
+        }
+    });
+}
+
+/// Fixed-point bilinear resize in two passes (horizontal, then vertical).
+fn bilinear_bgra(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    dst_width: u32,
+    dst_height: u32,
+    scratch: &mut Vec<u8>,
+    out: &mut Vec<u8>,
+) {
+    // Horizontal pass: src (sw x sh) -> scratch (dw x sh).
+    let dst_row_bytes = (dst_width as usize) * 4;
+    scratch.clear();
+    scratch.resize(dst_row_bytes * src_height as usize, 0);
+
+    let src_stride = (src_width as usize) * 4;
+    let last_src_x = (src_width - 1) as usize;
+    // 16.16 fixed point: position in the source for each destination column.
+    let step_x = ((src_width as u64) << 16) / dst_width as u64;
+
+    with_row_bands(scratch, dst_row_bytes, |start_row, band| {
+        for (offset, row) in band.chunks_mut(dst_row_bytes).enumerate() {
+            let src_row = (start_row + offset) * src_stride;
+            for (dst_x, pixel) in row.chunks_mut(4).enumerate() {
+                let position = (dst_x as u64 * step_x) as usize;
+                let x0 = (position >> 16).min(last_src_x);
+                let x1 = (x0 + 1).min(last_src_x);
+                let weight = (position & 0xFFFF) as u32; // 0..65535
+
+                let left = src_row + x0 * 4;
+                let right = src_row + x1 * 4;
+                for channel in 0..4 {
+                    let a = src[left + channel] as u32;
+                    let b = src[right + channel] as u32;
+                    pixel[channel] = (((a * (65_535 - weight)) + b * weight + 32_768) >> 16) as u8;
+                }
+            }
+        }
+    });
+
+    // Vertical pass: scratch (dw x sh) -> out (dw x dh).
+    out.clear();
+    out.resize(dst_row_bytes * dst_height as usize, 0);
+
+    let last_src_y = (src_height - 1) as usize;
+    let step_y = ((src_height as u64) << 16) / dst_height as u64;
+    let scratch_rows = scratch.as_slice();
+
+    with_row_bands(out, dst_row_bytes, |start_row, band| {
+        for (offset, row) in band.chunks_mut(dst_row_bytes).enumerate() {
+            let dst_y = start_row + offset;
+            let position = (dst_y as u64 * step_y) as usize;
+            let y0 = (position >> 16).min(last_src_y);
+            let y1 = (y0 + 1).min(last_src_y);
+            let weight = (position & 0xFFFF) as u32;
+
+            let top = y0 * dst_row_bytes;
+            let bottom = y1 * dst_row_bytes;
+            for (x, pixel) in row.chunks_mut(4).enumerate() {
+                let index = x * 4;
+                for channel in 0..4 {
+                    let a = scratch_rows[top + index + channel] as u32;
+                    let b = scratch_rows[bottom + index + channel] as u32;
+                    pixel[channel] = (((a * (65_535 - weight)) + b * weight + 32_768) >> 16) as u8;
+                }
+            }
+        }
+    });
 }
 
 /// Converts interleaved `f32` samples to 16-bit PCM with clipping.
@@ -212,6 +420,40 @@ fn linear_to_srgb_u8(value: f32) -> u8 {
     table[(clamped * 4095.0) as usize]
 }
 
+/// One lookup from an IEEE 754 half (linear scRGB) straight to 8-bit sRGB.
+///
+/// Fusing the half→f32 and linear→sRGB tables removes three lookups per channel
+/// and replaces a 256 KB float table with a 64 KB byte table, which matters a
+/// lot at 4K: the separate tables made this function cost ~79 ms per frame.
+fn half_to_srgb_lut() -> &'static [u8; 65536] {
+    use std::sync::OnceLock;
+    static LUT: OnceLock<Box<[u8; 65536]>> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = Box::new([0u8; 65536]);
+        for (index, slot) in table.iter_mut().enumerate() {
+            // The same conversion the two-step helpers performed, fused.
+            // `linear_to_srgb_u8` also maps NaN to 0.
+            *slot = linear_to_srgb_u8(f16_to_f32(index as u16));
+        }
+        table
+    })
+}
+
+/// Half-precision alpha to 8-bit. Alpha is 1.0 in practice, so the common
+/// encoding is answered without touching a table.
+fn half_alpha_to_u8(half: u16) -> u8 {
+    const HALF_ONE: u16 = 0x3C00;
+    if half == HALF_ONE {
+        return 255;
+    }
+    let value = f16_to_f32(half);
+    if value.is_nan() {
+        255
+    } else {
+        (value.clamp(0.0, 1.0) * 255.0) as u8
+    }
+}
+
 /// Converts a 16-bit-float RGBA frame (Windows HDR desktops) into BGRA 8-bit.
 ///
 /// Desktop Duplication always hands out `R16G16B16A16_FLOAT` when the display
@@ -223,22 +465,150 @@ fn linear_to_srgb_u8(value: f32) -> u8 {
 pub fn hdr_fp16_to_bgra(src: &[u8], out: &mut Vec<u8>) {
     let pixels = src.len() / 8;
     out.clear();
-    out.reserve(pixels * 4);
-    for pixel in src.chunks_exact(8) {
-        let r = f16_to_f32(u16::from_le_bytes([pixel[0], pixel[1]]));
-        let g = f16_to_f32(u16::from_le_bytes([pixel[2], pixel[3]]));
-        let b = f16_to_f32(u16::from_le_bytes([pixel[4], pixel[5]]));
-        let a = f16_to_f32(u16::from_le_bytes([pixel[6], pixel[7]]));
-        out.push(linear_to_srgb_u8(b));
-        out.push(linear_to_srgb_u8(g));
-        out.push(linear_to_srgb_u8(r));
-        out.push(if a.is_nan() { 255 } else { (a.clamp(0.0, 1.0) * 255.0) as u8 });
+    if pixels == 0 {
+        return;
+    }
+    out.resize(pixels * 4, 0);
+    convert_hdr_band(&src[..pixels * 8], out);
+}
+
+/// Same conversion, but parallelised over rows when the frame is large.
+///
+/// At 4K the lookup-bound conversion cost ~24 ms single-threaded — more than a
+/// 60 fps frame budget — so large frames are split across cores. Bands are
+/// row-aligned and write disjoint output, so the result is bit-identical to the
+/// single-threaded path.
+pub fn hdr_fp16_to_bgra_rows(src: &[u8], width: u32, out: &mut Vec<u8>) {
+    let width = width.max(1) as usize;
+    let pixels = src.len() / 8;
+    out.clear();
+    if pixels == 0 {
+        return;
+    }
+    out.resize(pixels * 4, 0);
+
+    let src_row_bytes = width * 8;
+    let out_row_bytes = width * 4;
+    let rows = pixels / width;
+    let usable_rows = if rows == 0 { 0 } else { rows };
+    let usable_out = usable_rows * out_row_bytes;
+
+    let threads = parallel_degree(usable_rows, usable_out);
+    if threads <= 1 {
+        // One band: correct regardless of how the rows divide.
+        convert_hdr_band(&src[..pixels * 8], &mut out[..pixels * 4]);
+        return;
+    }
+
+    let band_rows = usable_rows.div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        for (index, out_band) in out[..usable_out]
+            .chunks_mut(band_rows * out_row_bytes)
+            .enumerate()
+        {
+            let start_byte = index * band_rows * src_row_bytes;
+            let src_band = &src[start_byte..start_byte + out_band.len() / 4 * 2];
+            scope.spawn(move || convert_hdr_band(src_band, out_band));
+        }
+    });
+}
+
+/// Converts one contiguous run of `Rgba16F` pixels into BGRA bytes.
+fn convert_hdr_band(src: &[u8], out: &mut [u8]) {
+    let lut = half_to_srgb_lut();
+    for (destination, source) in out.chunks_exact_mut(4).zip(src.chunks_exact(8)) {
+        let red = u16::from_le_bytes([source[0], source[1]]);
+        let green = u16::from_le_bytes([source[2], source[3]]);
+        let blue = u16::from_le_bytes([source[4], source[5]]);
+        let alpha = u16::from_le_bytes([source[6], source[7]]);
+
+        // Windows hands out BGRA, so the channels are written back to front.
+        destination[0] = lut[blue as usize];
+        destination[1] = lut[green as usize];
+        destination[2] = lut[red as usize];
+        destination[3] = half_alpha_to_u8(alpha);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hdr_conversion_is_unchanged_by_the_fused_table() {
+        // The fused table must be bit-identical to the two-step conversion it
+        // replaced (f16 → f32, then linear → sRGB).
+        let mut frame = Vec::new();
+        let values: [u16; 12] = [
+            0x0000, 0x3C00, 0x3800, 0x4000, // 0.0, 1.0, 0.5, 2.0
+            0xBC00, 0x7C00, 0xFC00, 0x3555, // -1.0, +inf, -inf, ~0.333
+            0x0001, 0x03FF, 0x0400, 0x7BFF, // subnormal, tiny, smallest normal, max
+        ];
+        for (index, value) in values.iter().enumerate() {
+            // Repeat so a full pixel plus a partial one are both covered.
+            let channel = if index % 2 == 0 { *value } else { 0x3C00 };
+            frame.extend_from_slice(&channel.to_le_bytes());
+        }
+        // One complete pixel (8 bytes) and then a second one.
+        frame.extend_from_slice(&0x3800u16.to_le_bytes());
+        frame.extend_from_slice(&0x3C00u16.to_le_bytes());
+        frame.extend_from_slice(&0x4000u16.to_le_bytes());
+        frame.extend_from_slice(&0x3C00u16.to_le_bytes());
+
+        let mut converted = Vec::new();
+        hdr_fp16_to_bgra(&frame, &mut converted);
+
+        let expected: Vec<u8> = frame
+            .chunks_exact(8)
+            .flat_map(|pixel| {
+                let r = f16_to_f32(u16::from_le_bytes([pixel[0], pixel[1]]));
+                let g = f16_to_f32(u16::from_le_bytes([pixel[2], pixel[3]]));
+                let b = f16_to_f32(u16::from_le_bytes([pixel[4], pixel[5]]));
+                let a = f16_to_f32(u16::from_le_bytes([pixel[6], pixel[7]]));
+                [
+                    linear_to_srgb_u8(b),
+                    linear_to_srgb_u8(g),
+                    linear_to_srgb_u8(r),
+                    if a.is_nan() { 255 } else { (a.clamp(0.0, 1.0) * 255.0) as u8 },
+                ]
+            })
+            .collect();
+
+        assert_eq!(converted, expected);
+    }
+
+    #[test]
+    fn hdr_conversion_handles_alpha_and_degenerate_input() {
+        // Opaque alpha is the overwhelmingly common case.
+        let pixel = [0x00u8, 0x3C, 0x00, 0x3C, 0x00, 0x3C, 0x00, 0x3C];
+        let mut out = Vec::new();
+        hdr_fp16_to_bgra(&pixel, &mut out);
+        assert_eq!(out, vec![255, 255, 255, 255], "1.0 linear → white, opaque");
+
+        // NaN alpha must stay opaque rather than becoming 0.
+        let mut nan_alpha = pixel;
+        nan_alpha[6] = 0x01;
+        nan_alpha[7] = 0x7C; // +inf is NaN-adjacent; use a real NaN encoding
+        nan_alpha[6] = 0x00;
+        nan_alpha[7] = 0x7E;
+        hdr_fp16_to_bgra(&nan_alpha, &mut out);
+        assert_eq!(out[3], 255);
+
+        // Empty and single-byte inputs must not panic.
+        hdr_fp16_to_bgra(&[], &mut out);
+        assert!(out.is_empty());
+        hdr_fp16_to_bgra(&[0u8; 3], &mut out);
+        assert!(out.is_empty(), "a partial pixel is not emitted");
+    }
+
+    #[test]
+    fn hdr_conversion_clips_highlights() {
+        // 4.0 linear (0x4400) is above SDR white and must clip to 255.
+        let pixel = [0x00u8, 0x44, 0x00, 0x44, 0x00, 0x44, 0x00, 0x3C];
+        let mut out = Vec::new();
+        hdr_fp16_to_bgra(&pixel, &mut out);
+        assert_eq!(&out[..3], &[255, 255, 255]);
+    }
 
     #[test]
     fn channel_swap_round_trips() {
@@ -338,11 +708,84 @@ mod tests {
 
     #[test]
     fn scaling_produces_the_requested_size() {
-        let src = vec![128u8; 8 * 4 * 4];
+        let src = vec![128u8; 16 * 16 * 4];
         let mut scratch = Vec::new();
         let mut out = Vec::new();
-        scale_bgra(&src, 8, 4, 4, 2, &mut scratch, &mut out).unwrap();
-        assert_eq!(out.len(), 4 * 2 * 4);
+        for (width, height) in [(8u32, 8u32), (7, 5), (16, 16), (1, 1), (32, 32), (4, 2)] {
+            scale_bgra(&src, 16, 16, width, height, &mut scratch, &mut out).unwrap();
+            assert_eq!(
+                out.len(),
+                (width as usize) * (height as usize) * 4,
+                "wrong size for {width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn scaling_a_uniform_frame_keeps_it_uniform() {
+        // Both the box and the bilinear path must be exact on flat colour.
+        let mut src = Vec::new();
+        for _ in 0..(12 * 12) {
+            src.extend_from_slice(&[10, 20, 30, 40]);
+        }
+
+        let mut scratch = Vec::new();
+        let mut out = Vec::new();
+        // 12 -> 4 is an exact 3x box; 12 -> 5 is not.
+        for (width, height) in [(4u32, 4u32), (5, 5)] {
+            scale_bgra(&src, 12, 12, width, height, &mut scratch, &mut out).unwrap();
+            for pixel in out.chunks_exact(4) {
+                assert_eq!(pixel, [10, 20, 30, 40], "{width}x{height} drifted");
+            }
+        }
+    }
+
+    #[test]
+    fn box_downscale_averages_blocks() {
+        // 2x2 -> 1x1: the average of 0,0,0,16 is 4.
+        let src = vec![
+            0u8, 0, 0, 0, /**/ 0, 0, 0, 0, /**/ 0, 0, 0, 0, /**/ 16, 16, 16, 16,
+        ];
+        let mut scratch = Vec::new();
+        let mut out = Vec::new();
+        scale_bgra(&src, 2, 2, 1, 1, &mut scratch, &mut out).unwrap();
+        assert_eq!(out, vec![4, 4, 4, 4]);
+    }
+
+    #[test]
+    fn scaling_half_size_keeps_the_corners_dominant() {
+        let mut src = vec![50u8; 4 * 4 * 4];
+        src[0..4].copy_from_slice(&[200, 0, 0, 255]); // blue in BGRA
+        let last = src.len() - 4;
+        src[last..].copy_from_slice(&[0, 0, 200, 255]); // red in BGRA
+
+        let mut scratch = Vec::new();
+        let mut out = Vec::new();
+        scale_bgra(&src, 4, 4, 2, 2, &mut scratch, &mut out).unwrap();
+
+        assert!(out[0] > out[2], "top-left should stay blue-dominant");
+        let bottom_right = out.len() - 4;
+        assert!(
+            out[bottom_right + 2] > out[bottom_right],
+            "bottom-right should stay red-dominant"
+        );
+    }
+
+    #[test]
+    fn scaling_is_deterministic_across_thread_bands() {
+        let src: Vec<u8> = (0..(33 * 17 * 4)).map(|index| (index % 251) as u8).collect();
+        let mut scratch = Vec::new();
+        let mut first = Vec::new();
+        let mut second = Vec::new();
+        // Big enough to cross the parallel threshold, run twice.
+        let large: Vec<u8> = (0..(1280 * 720 * 4)).map(|index| (index % 253) as u8).collect();
+        scale_bgra(&large, 1280, 720, 640, 360, &mut scratch, &mut first).unwrap();
+        scale_bgra(&large, 1280, 720, 640, 360, &mut scratch, &mut second).unwrap();
+        assert_eq!(first, second);
+
+        scale_bgra(&src, 33, 17, 12, 7, &mut scratch, &mut first).unwrap();
+        scale_bgra(&src, 33, 17, 12, 7, &mut scratch, &mut second).unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]

@@ -80,7 +80,7 @@ pub fn run(
                                     "显示器处于 HDR 模式，正在把 16 位浮点画面转换为 SDR 后再编码"
                                 );
                             }
-                            util::hdr_fp16_to_bgra(data, &mut hdr);
+                            util::hdr_fp16_to_bgra_rows(data, width, &mut hdr);
                             pipeline.push_bgra(&hdr, width, height)
                         }
                     }

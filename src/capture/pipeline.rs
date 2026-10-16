@@ -281,6 +281,18 @@ impl FramePipeline {
 
     /// Writes one output frame from already final-sized pixels.
     fn emit(&mut self, pixels: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
+        self.emit_inner(pixels, width, height, true)
+    }
+
+    /// `remember` is false when the pixels already *are* the remembered frame
+    /// (the gap-filling path), which avoids copying a whole frame per filler.
+    fn emit_inner(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        remember: bool,
+    ) -> anyhow::Result<()> {
         let index = self.pacer.emitted();
         let frame = FrameData {
             pixels,
@@ -305,9 +317,11 @@ impl FramePipeline {
 
         // Remember this frame so a stalled source can still extend the
         // recording timeline instead of truncating it.
-        self.duplicate.clear();
-        self.duplicate.extend_from_slice(pixels);
-        self.duplicate_valid = true;
+        if remember {
+            self.duplicate.clear();
+            self.duplicate.extend_from_slice(pixels);
+            self.duplicate_valid = true;
+        }
 
         self.pacer.advance();
         self.shared.bump_frames();
@@ -338,7 +352,8 @@ impl FramePipeline {
         let result = (|| -> anyhow::Result<()> {
             let due = self.pacer.frames_due(elapsed);
             while self.pacer.emitted() < due {
-                self.emit(&duplicate, width, height)?;
+                // Already the remembered frame: do not copy it back onto itself.
+                self.emit_inner(&duplicate, width, height, false)?;
             }
             Ok(())
         })();
