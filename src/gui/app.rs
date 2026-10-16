@@ -16,6 +16,7 @@ use crate::capture::{
 use crate::config::{AppConfig, OutputDirOutcome, SavedSource, ThemeMode};
 use crate::encode::capability::CapabilityMap;
 use crate::ffmpeg::{self, FfmpegInfo};
+use crate::history::HistoryStore;
 use crate::formats::{self, AudioCodec, Container, QualityPreset, ScaleOption};
 use crate::hotkeys::{HotkeyAction, HotkeyManager};
 use crate::paths;
@@ -23,8 +24,18 @@ use crate::paths;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Record,
+    History,
     Settings,
     About,
+}
+
+/// What the history tab wants to do with the selected recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryAction {
+    Open(u64),
+    Reveal(u64),
+    CopyPath(u64),
+    Remove(u64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,6 +90,11 @@ pub struct ScreenRecApp {
     /// Result of the runtime encoder probe, when it has finished.
     capabilities: Option<CapabilityMap>,
     capability_rx: Option<std::sync::mpsc::Receiver<CapabilityMap>>,
+
+    /// Recording history shown in the "记录" tab.
+    history: HistoryStore,
+    selected_entry: Option<u64>,
+    confirm_clear_history: bool,
 }
 
 impl ScreenRecApp {
@@ -114,6 +130,9 @@ impl ScreenRecApp {
             hotkey_registered: 0,
             capabilities: None,
             capability_rx: None,
+            history: HistoryStore::load(),
+            selected_entry: None,
+            confirm_clear_history: false,
         };
 
         app.refresh_sources();
@@ -317,6 +336,8 @@ impl ScreenRecApp {
         self.shared = None;
         self.preview_texture = None;
         self.snapshot = SessionSnapshot::default();
+        // The recorder appended the entry as it closed the file.
+        self.reload_history();
     }
 
     /// Called when the capture thread stopped on its own (source closed, error).
@@ -345,6 +366,7 @@ impl ScreenRecApp {
 
         self.shared = None;
         self.preview_texture = None;
+        self.reload_history();
     }
 
     fn toggle_pause(&mut self) {
@@ -577,6 +599,12 @@ impl ScreenRecApp {
             ui.separator();
 
             ui.selectable_value(&mut self.tab, Tab::Record, "录制");
+            let history_label = if self.history.is_empty() {
+                "记录".to_string()
+            } else {
+                format!("记录 ({})", self.history.len())
+            };
+            ui.selectable_value(&mut self.tab, Tab::History, history_label);
             ui.selectable_value(&mut self.tab, Tab::Settings, "设置");
             ui.selectable_value(&mut self.tab, Tab::About, "关于");
 
@@ -1180,6 +1208,251 @@ impl ScreenRecApp {
         });
     }
 
+    /// "记录" tab: past recordings, with actions for the selected one.
+    ///
+    /// Recordings are appended by [`crate::capture::Recorder`] as soon as they
+    /// finish, so this list also covers recordings started from the CLI.
+    fn history_tab(&mut self, ui: &mut egui::Ui) {
+        let count = self.history.len();
+        let total_bytes = self.history.total_bytes();
+        let missing = count - self.history.existing_count();
+        let output_dir = self.config.output_dir.clone();
+
+        // The UI closures only touch these locals; actions are applied below so
+        // that `self` is never borrowed twice.
+        let mut select: Option<u64> = None;
+        let mut action: Option<HistoryAction> = None;
+        let mut open_output_dir = false;
+        let mut refresh = false;
+        let mut clear = false;
+
+        ui.horizontal(|ui| {
+            ui.heading("录制记录");
+            ui.label(
+                RichText::new(format!(
+                    "共 {count} 条 · 合计 {}",
+                    crate::units::format_size(total_bytes)
+                ))
+                .color(colors::MUTED)
+                .small(),
+            );
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if self.confirm_clear_history {
+                    if ui
+                        .button(RichText::new("确定清空").color(colors::ERROR))
+                        .on_hover_text("只删除记录，不会删除录制文件")
+                        .clicked()
+                    {
+                        clear = true;
+                    }
+                    if ui.button("取消").clicked() {
+                        self.confirm_clear_history = false;
+                    }
+                } else if ui
+                    .add_enabled(!self.history.is_empty(), egui::Button::new("清空记录"))
+                    .on_hover_text("只删除记录，不会删除录制文件")
+                    .clicked()
+                {
+                    self.confirm_clear_history = true;
+                }
+
+                if ui.button("刷新").clicked() {
+                    refresh = true;
+                }
+                if ui.button("打开录制文件夹").clicked() {
+                    open_output_dir = true;
+                }
+            });
+        });
+
+        if missing > 0 {
+            ui.label(
+                RichText::new(format!(
+                    "⚠ 有 {missing} 条记录对应的文件已不在原位置（可能是被移动或删除）"
+                ))
+                .color(colors::WARN)
+                .small(),
+            );
+        }
+
+        ui.separator();
+
+        if count == 0 {
+            widgets::hint(ui, "还没有录制记录。完成一次录制后会自动出现在这里。");
+            widgets::hint(ui, "双击某一行可以直接打开对应的录制文件。");
+            return;
+        }
+
+        let entries = self.history.entries().to_vec();
+        let selected_id = self.selected_entry;
+
+        egui::ScrollArea::vertical()
+            .max_height(ui.available_height() - 150.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("history_table")
+                    .num_columns(6)
+                    .striped(true)
+                    .spacing([14.0, 6.0])
+                    .show(ui, |ui| {
+                        for header in ["时间", "来源", "格式", "时长", "大小", "状态"] {
+                            ui.label(RichText::new(header).strong().small());
+                        }
+                        ui.end_row();
+
+                        for entry in &entries {
+                            let selected = selected_id == Some(entry.id);
+                            let response = ui
+                                .selectable_label(selected, entry.created_text())
+                                .on_hover_text(entry.path.display().to_string());
+                            if response.clicked() {
+                                select = Some(entry.id);
+                            }
+                            if response.double_clicked() {
+                                select = Some(entry.id);
+                                action = Some(HistoryAction::Open(entry.id));
+                            }
+
+                            ui.label(&entry.source_label);
+                            ui.label(entry.container.to_uppercase());
+                            ui.label(crate::units::format_duration(entry.duration()));
+                            ui.label(crate::units::format_size(entry.bytes));
+
+                            if entry.exists {
+                                ui.label(RichText::new("正常").color(colors::OK).small());
+                            } else {
+                                ui.label(RichText::new("文件丢失").color(colors::ERROR).small());
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+
+        let selected = selected_id
+            .or_else(|| entries.first().map(|entry| entry.id))
+            .and_then(|id| entries.iter().find(|entry| entry.id == id).cloned());
+
+        if let Some(entry) = selected {
+            ui.add_space(6.0);
+            widgets::section(ui, "详情", |ui| {
+                widgets::key_value(ui, "文件", entry.file_name());
+                widgets::key_value(ui, "完整路径", entry.path.display().to_string());
+                widgets::key_value(ui, "分辨率", entry.resolution_text());
+                widgets::key_value(ui, "声音", entry.audio.clone());
+                widgets::key_value(ui, "编码器", entry.backend.clone());
+                widgets::key_value(ui, "大小", crate::units::format_size(entry.bytes));
+            });
+
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(entry.exists, egui::Button::new("打开文件"))
+                    .clicked()
+                {
+                    action = Some(HistoryAction::Open(entry.id));
+                }
+                if ui
+                    .add_enabled(entry.exists, egui::Button::new("在文件夹中显示"))
+                    .clicked()
+                {
+                    action = Some(HistoryAction::Reveal(entry.id));
+                }
+                if ui.button("复制路径").clicked() {
+                    action = Some(HistoryAction::CopyPath(entry.id));
+                }
+                if ui
+                    .button("从记录中删除")
+                    .on_hover_text("只删除记录，不会删除录制文件")
+                    .clicked()
+                {
+                    action = Some(HistoryAction::Remove(entry.id));
+                }
+            });
+        }
+
+        // ---- apply the collected intents ----
+        if refresh {
+            self.history.refresh_existence();
+            self.info("已重新检查录制文件");
+        }
+        if open_output_dir {
+            if let Err(err) = std::fs::create_dir_all(&output_dir) {
+                self.error(format!("无法创建录制文件夹：{err}"));
+            } else if let Err(err) = opener::open(&output_dir) {
+                self.error(format!("无法打开文件夹：{err}"));
+            }
+        }
+        if clear {
+            match self.history.clear() {
+                Ok(()) => {
+                    self.selected_entry = None;
+                    self.confirm_clear_history = false;
+                    self.info("已清空录制记录（录制文件未被删除）");
+                }
+                Err(err) => self.error(format!("清空记录失败：{err}")),
+            }
+        }
+        if let Some(id) = select {
+            self.selected_entry = Some(id);
+        }
+        match action {
+            Some(HistoryAction::Open(id)) => self.open_history_entry(id),
+            Some(HistoryAction::Reveal(id)) => self.reveal_history_entry(id),
+            Some(HistoryAction::CopyPath(id)) => {
+                if let Some(entry) = self.history.find(id) {
+                    let path = entry.path.display().to_string();
+                    ui.ctx().copy_text(path.clone());
+                    self.info(format!("已复制路径：{path}"));
+                }
+            }
+            Some(HistoryAction::Remove(id)) => {
+                let name = self.history.find(id).map(|entry| entry.file_name());
+                match self.history.remove(id) {
+                    Ok(true) => {
+                        if self.selected_entry == Some(id) {
+                            self.selected_entry = None;
+                        }
+                        self.info(format!(
+                            "已从记录中删除 {}（录制文件保留）",
+                            name.unwrap_or_default()
+                        ));
+                    }
+                    Ok(false) => self.info("该记录已不存在"),
+                    Err(err) => self.error(format!("删除记录失败：{err}")),
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn open_history_entry(&mut self, id: u64) {
+        let Some(entry) = self.history.find(id).cloned() else {
+            return;
+        };
+        if !entry.path.exists() {
+            self.error(format!("录制文件已不存在：{}", entry.path.display()));
+            return;
+        }
+        match opener::open(&entry.path) {
+            Ok(()) => self.info(format!("已打开 {}", entry.file_name())),
+            Err(err) => self.error(format!("无法打开文件：{err}")),
+        }
+    }
+
+    fn reveal_history_entry(&mut self, id: u64) {
+        let Some(entry) = self.history.find(id).cloned() else {
+            return;
+        };
+        if let Err(err) = crate::paths::reveal_in_file_manager(&entry.path) {
+            self.error(format!("无法在文件夹中显示：{err}"));
+        }
+    }
+
+    /// Reloads the history from disk, e.g. after a recording finished.
+    fn reload_history(&mut self) {
+        self.history = HistoryStore::load();
+    }
+
     fn settings_tab(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1579,6 +1852,7 @@ impl eframe::App for ScreenRecApp {
 
         egui::CentralPanel::default().show(ui, |ui| match self.tab {
             Tab::Record => self.record_tab(ui),
+            Tab::History => self.history_tab(ui),
             Tab::Settings => self.settings_tab(ui),
             Tab::About => self.about_tab(ui),
         });

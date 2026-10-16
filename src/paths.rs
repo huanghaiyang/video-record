@@ -162,6 +162,42 @@ pub fn default_output_dir() -> PathBuf {
         .join("ScreenRec")
 }
 
+/// Path to hand to the file manager: the file itself when it exists, otherwise
+/// its folder (so a deleted recording still opens somewhere useful).
+pub fn reveal_target(path: &Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => path.to_path_buf(),
+    }
+}
+
+/// Shows a file in the system file manager, selecting it when possible.
+///
+/// Implemented directly instead of through `opener::reveal`, which is gated
+/// behind a feature that drags in a Linux-only D-Bus dependency.
+pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
+    let target = reveal_target(path);
+
+    #[cfg(windows)]
+    {
+        // `explorer /select,<path>` is what the shell itself uses. It reports a
+        // non-zero exit code even when it succeeds, so it is spawned and not
+        // waited on.
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", target.display()))
+            .spawn()
+            .map(|_| ())
+    }
+
+    #[cfg(not(windows))]
+    {
+        opener::open(&target).map_err(|err| std::io::Error::other(err.to_string()))
+    }
+}
+
 /// Checks that a folder exists and can actually be written to.
 ///
 /// Creating a directory is not enough: a folder can exist yet be read-only, or
@@ -334,8 +370,22 @@ mod tests {
     }
 
     #[test]
-    fn writability_check_accepts_temp_and_rejects_a_file_path() {
-        let dir = std::env::temp_dir().join(format!("screenrec_writable_{}", std::process::id()));
+    fn reveal_target_falls_back_to_the_parent_folder() {
+        let dir = std::env::temp_dir().join(format!("screenrec_reveal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("clip.mp4");
+        std::fs::write(&file, b"x").unwrap();
+
+        // An existing file is selected directly.
+        assert_eq!(reveal_target(&file), file);
+        // A missing file resolves to its folder, so the user still gets there.
+        assert_eq!(reveal_target(&dir.join("gone.mp4")), dir);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn writability_check_accepts_temp_and_rejects_a_file_path() {        let dir = std::env::temp_dir().join(format!("screenrec_writable_{}", std::process::id()));
         assert!(is_writable(&dir).is_ok());
 
         // A path whose parent is a regular file can never be a directory.

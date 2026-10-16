@@ -13,6 +13,7 @@ use crate::config::{AppConfig, OutputDirOutcome};
 use crate::encode;
 use crate::ffmpeg;
 use crate::formats::{self, Container, QualityPreset, ScaleOption, VideoCodec};
+use crate::history::HistoryStore;
 use crate::logging;
 
 #[derive(Parser, Debug)]
@@ -35,6 +36,8 @@ pub struct Cli {
 pub enum Command {
     /// 录制显示器或窗口
     Record(RecordArgs),
+    /// 查看录制记录
+    History(HistoryArgs),
     /// 列出可录制的显示器与窗口
     Sources(SourcesArgs),
     /// 列出支持的导出格式与对应后端
@@ -150,6 +153,33 @@ pub struct SourcesArgs {
 }
 
 #[derive(Args, Debug)]
+pub struct HistoryArgs {
+    /// 只显示最近 N 条（0 表示全部）
+    #[arg(long, default_value_t = 20)]
+    pub limit: usize,
+
+    /// 以 JSON 输出，便于脚本处理
+    #[arg(long)]
+    pub json: bool,
+
+    /// 清空全部记录（只删除记录，不删除录制文件）
+    #[arg(long)]
+    pub clear: bool,
+
+    /// 打开指定 id 的录制文件
+    #[arg(long)]
+    pub open: Option<u64>,
+
+    /// 删除指定 id 的记录（不删除录制文件）
+    #[arg(long)]
+    pub remove: Option<u64>,
+
+    /// 重新检查录制文件是否仍然存在
+    #[arg(long)]
+    pub verify: bool,
+}
+
+#[derive(Args, Debug)]
 pub struct ProbeArgs {
     /// 把探测文件写到该目录（默认写到临时目录，探测完删除）
     #[arg(long)]
@@ -177,6 +207,7 @@ use crate::WindowInfo;
 pub fn run(command: Command) -> anyhow::Result<()> {
     match command {
         Command::Record(args) => record(args),
+        Command::History(args) => history(args),
         Command::Sources(args) => list_sources(args),
         Command::Formats => list_formats(),
         Command::Probe(args) => probe(args),
@@ -454,6 +485,135 @@ fn resolve_window_query(windows: &[WindowInfo], query: &str) -> anyhow::Result<S
     }
 }
 
+// --------------------------------------------------------------- history ----
+
+fn history(args: HistoryArgs) -> anyhow::Result<()> {
+    let mut store = HistoryStore::load();
+
+    if args.clear {
+        let count = store.len();
+        store.clear()?;
+        println!("已清空 {count} 条录制记录（录制文件未被删除）");
+        return Ok(());
+    }
+
+    if args.verify {
+        store.refresh_existence();
+    }
+
+    if let Some(id) = args.remove {
+        let entry = store.find(id).cloned();
+        return match entry {
+            Some(entry) => {
+                store.remove(id)?;
+                println!("已删除记录 #{}（{}），录制文件保留在 {}", id, entry.file_name(), entry.path.display());
+                Ok(())
+            }
+            None => anyhow::bail!("找不到 id 为 {id} 的录制记录"),
+        };
+    }
+
+    if let Some(id) = args.open {
+        let entry = store
+            .find(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("找不到 id 为 {id} 的录制记录"))?;
+        anyhow::ensure!(entry.path.exists(), "录制文件已不存在：{}", entry.path.display());
+        opener::open(&entry.path)
+            .map_err(|err| anyhow::anyhow!("无法打开 {}：{err}", entry.path.display()))?;
+        println!("已打开 {}", entry.path.display());
+        return Ok(());
+    }
+
+    if args.json {
+        let payload: Vec<serde_json::Value> = store
+            .entries()
+            .iter()
+            .take(if args.limit == 0 { usize::MAX } else { args.limit })
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "created": entry.created_text(),
+                    "created_unix_ms": entry.created_unix_ms,
+                    "source_kind": entry.source_kind,
+                    "source_label": entry.source_label,
+                    "container": entry.container,
+                    "codec": entry.codec,
+                    "backend": entry.backend,
+                    "path": entry.path,
+                    "bytes": entry.bytes,
+                    "duration_ms": entry.duration_ms,
+                    "frames": entry.frames,
+                    "frame_rate": entry.frame_rate,
+                    "source_size": entry.source_size,
+                    "output_size": entry.output_size,
+                    "audio": entry.audio,
+                    "exists": entry.exists,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "path": store.path(),
+                "total": store.len(),
+                "total_bytes": store.total_bytes(),
+                "entries": payload,
+            })
+        );
+        return Ok(());
+    }
+
+    if store.is_empty() {
+        println!("暂无录制记录（记录保存在 {}）", store.path().display());
+        return Ok(());
+    }
+
+    println!(
+        "记录文件：{}（共 {} 条，合计 {}）",
+        store.path().display(),
+        store.len(),
+        human_size(store.total_bytes())
+    );
+    println!();
+    println!(
+        "{} {} {} {} {} 来源 / 文件",
+        crate::units::pad_display("时间", 20),
+        crate::units::pad_display("格式", 10),
+        crate::units::pad_display("时长", 8),
+        crate::units::pad_display("大小", 10),
+        crate::units::pad_display("状态", 10),
+    );
+
+    let limit = if args.limit == 0 { usize::MAX } else { args.limit };
+    let indent = " ".repeat(60);
+    for entry in store.entries().iter().take(limit) {
+        let status = if entry.exists { "正常" } else { "文件丢失" };
+        let title = format!("{} · {}", entry.source_label, entry.file_name());
+        println!(
+            "{} {} {} {} {} {title}",
+            crate::units::pad_display(&entry.created_text(), 20),
+            crate::units::pad_display(&entry.container.to_uppercase(), 10),
+            crate::units::pad_display(&crate::units::format_duration(entry.duration()), 8),
+            crate::units::pad_display(&human_size(entry.bytes), 10),
+            crate::units::pad_display(status, 10),
+        );
+        println!("{indent}{}", entry.path.display());
+    }
+
+    if store.len() > limit {
+        println!();
+        println!("（其余 {} 条请用 --limit 0 查看）", store.len() - limit);
+    }
+
+    let missing = store.len() - store.existing_count();
+    if missing > 0 {
+        println!();
+        println!("提示：有 {missing} 条记录对应的文件已不在原位置，可用 --verify 刷新状态。");
+    }
+    Ok(())
+}
+
 // --------------------------------------------------------------- sources ----
 
 fn list_sources(args: SourcesArgs) -> anyhow::Result<()> {
@@ -493,9 +653,9 @@ fn list_sources(args: SourcesArgs) -> anyhow::Result<()> {
     println!("窗口（{} 个，可用 --window 句柄或标题关键字选择）", windows.len());
     for window in windows.iter().take(60) {
         println!(
-            "  {:<12} {:<50} {}x{}  {}",
-            format!("0x{:X}", window.hwnd),
-            truncate(&window.title, 48),
+            "  {} {} {}x{}  {}",
+            crate::units::pad_display(&format!("0x{:X}", window.hwnd), 12),
+            crate::units::pad_display(&truncate(&window.title, 48), 48),
             window.width,
             window.height,
             window.process
@@ -522,8 +682,10 @@ fn list_formats() -> anyhow::Result<()> {
     );
 
     println!(
-        "{:<28} {:<34} {:<10} 需要 FFmpeg",
-        "容器", "可用编码器", "后端"
+        "{} {} {} 需要 FFmpeg",
+        crate::units::pad_display("容器", 28),
+        crate::units::pad_display("可用编码器", 34),
+        crate::units::pad_display("后端", 26)
     );
     for container in Container::ALL {
         for (position, codec) in formats::codecs_for(container).iter().enumerate() {
@@ -541,10 +703,10 @@ fn list_formats() -> anyhow::Result<()> {
                 String::new()
             };
             println!(
-                "{:<28} {:<34} {:<10} {}",
-                container_label,
-                codec.label(),
-                backend,
+                "{} {} {} {}",
+                crate::units::pad_display(&container_label, 28),
+                crate::units::pad_display(codec.label(), 34),
+                crate::units::pad_display(&backend, 26),
                 needs
             );
         }
@@ -635,6 +797,13 @@ fn doctor() -> anyhow::Result<()> {
     let config = AppConfig::load();
     println!();
     println!("采集方式：{}", config.capture_method.label());
+    let history = HistoryStore::load();
+    println!(
+        "录制记录：{} 条，合计 {}（{}）",
+        history.len(),
+        human_size(history.total_bytes()),
+        history.path().display()
+    );
     println!(
         "默认输出目录：{}",
         config.output_dir.display()
@@ -694,25 +863,23 @@ fn doctor() -> anyhow::Result<()> {
 // --------------------------------------------------------------- helpers ----
 
 fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.2} {}", UNITS[unit])
-    }
+    crate::units::format_size(bytes)
 }
 
-/// Truncates a string for table output, respecting UTF-8 boundaries.
-fn truncate(text: &str, max_chars: usize) -> String {
-    let mut out: String = text.chars().take(max_chars).collect();
-    if text.chars().count() > max_chars {
-        out.push('…');
+/// Truncates a string to `max_columns` terminal columns, appending an ellipsis.
+///
+/// Uses display width rather than `char` count so Chinese titles line up.
+fn truncate(text: &str, max_columns: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for character in text.chars() {
+        let width = crate::units::char_width(character);
+        if used + width > max_columns {
+            out.push('…');
+            return out;
+        }
+        out.push(character);
+        used += width;
     }
     out
 }
@@ -729,9 +896,13 @@ mod tests {
     }
 
     #[test]
-    fn truncate_respects_character_boundaries() {
-        assert_eq!(truncate("记事本 - 未命名", 3), "记事本…");
+    fn truncate_respects_display_width() {
+        assert_eq!(truncate("abcdef", 3), "abc…");
         assert_eq!(truncate("abc", 10), "abc");
+        // Each Chinese character occupies two columns.
+        assert_eq!(truncate("记事本", 4), "记事…");
+        assert_eq!(truncate("记事本", 6), "记事本");
+        assert!(crate::units::display_width(&truncate("记事本标题很长", 10)) <= 11);
     }
 
     #[test]

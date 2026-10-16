@@ -81,49 +81,18 @@ pub fn folder_row(ui: &mut Ui, label: &str, path: &mut std::path::PathBuf) -> bo
 }
 
 /// Formats a duration as `mm:ss` (or `h:mm:ss` past an hour).
-pub fn format_duration(duration: std::time::Duration) -> String {
-    let total = duration.as_secs();
-    let hours = total / 3600;
-    let minutes = (total % 3600) / 60;
-    let seconds = total % 60;
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes:02}:{seconds:02}")
-    }
-}
+pub use crate::units::format_duration;
 
 /// Human readable byte size.
-pub fn format_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
-    let mut value = bytes as f64;
-    let mut unit = 0;
-    while value >= 1024.0 && unit < UNITS.len() - 1 {
-        value /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
-}
+pub use crate::units::format_size;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn durations_are_formatted() {
-        assert_eq!(format_duration(std::time::Duration::from_secs(5)), "00:05");
-        assert_eq!(format_duration(std::time::Duration::from_secs(75)), "01:15");
-        assert_eq!(format_duration(std::time::Duration::from_secs(3725)), "1:02:05");
-    }
-
-    #[test]
-    fn sizes_are_formatted() {
-        assert_eq!(format_size(999), "999 B");
-        assert_eq!(format_size(2048), "2.0 KB");
-        assert_eq!(format_size(3 * 1024 * 1024), "3.0 MB");
+    fn widget_helpers_stay_available() {
+        assert_eq!(format_duration(std::time::Duration::from_secs(65)), "01:05");
+        assert_eq!(format_size(1024), "1.00 KB");
     }
 }

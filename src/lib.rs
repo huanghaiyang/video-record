@@ -19,9 +19,11 @@ pub mod encode;
 pub mod ffmpeg;
 pub mod formats;
 pub mod gui;
+pub mod history;
 pub mod hotkeys;
 pub mod logging;
 pub mod paths;
+pub mod units;
 
 pub use capture::sources::WindowInfo;
 

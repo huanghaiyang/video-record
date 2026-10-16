@@ -65,6 +65,20 @@
 - 截图：任意时刻抓取当前显示器一帧，保存为 PNG/JPEG/BMP。
 - 录制测试图案：不采集屏幕即可验证编码设置与文件封装。
 
+### 录制记录
+每次录制完成后自动写入一条记录（`history.json`），界面「记录」页签与
+`screenrec history` 命令都能查看：
+
+- 记录内容：时间、录制源、容器/编码器、实际后端、时长、帧数与帧率、
+  分辨率（源与输出）、音轨、文件大小、完整路径。
+- 界面操作：双击行直接打开文件，另有「打开文件 / 在文件夹中显示 / 复制路径 /
+  从记录中删除」，以及「刷新」（重新检查文件是否还在）与「清空记录」。
+- 删除记录**不会删除录制文件**；文件被移动或删除后会在列表中标为「文件丢失」。
+- 命令行同样可用，且支持 JSON 便于脚本处理；GUI 与 CLI 共用同一份记录，
+  所以命令行录的内容也会出现在界面里。
+- 记录文件与配置放在一起（见下），最多保留最近 500 条，写入采用「临时文件 + 改名」
+  的原子方式，损坏时自动备份为 `history.json.broken` 并重新开始，不影响录制。
+
 ---
 
 ## 2. 环境要求
@@ -123,11 +137,12 @@ node scripts\fetch-ffmpeg.mjs
 ```text
 screenrec                      # 图形界面
 screenrec record   [选项]      # 录制
+screenrec history  [选项]      # 查看/管理录制记录
 screenrec sources  [--json]    # 列出显示器与窗口
 screenrec formats              # 列出导出格式与后端
-screenrec probe    [--keep]    # 逐个写出小文件，实测本机可用的编码器
+screenrec probe    [--strict]  # 逐个写出小文件，实测本机可用的编码器
 screenrec frame    --out a.png # 抓取一帧画面
-screenrec doctor               # 环境、路径、配置、FFmpeg、显示器信息
+screenrec doctor               # 环境、路径、配置、FFmpeg、显示器、记录信息
 ```
 
 常用录制参数：
@@ -157,13 +172,28 @@ screenrec record --monitor 1 --capture dxgi --duration 5
 screenrec record --test-pattern --format mp4 --duration 5 --system-audio
 ```
 
-`--json` 可让 `record`/`sources` 输出 JSON，便于脚本集成。
+`--json` 可让 `record`/`sources`/`history` 输出 JSON，便于脚本集成。
+
+录制记录相关参数：
+
+```powershell
+screenrec history                    # 最近 20 条
+screenrec history --limit 0          # 全部
+screenrec history --json             # JSON 输出
+screenrec history --open 1792127920317      # 打开指定 id 的录制文件
+screenrec history --remove 1792127920317    # 只删记录，不删文件
+screenrec history --verify           # 重新检查文件是否还在
+screenrec history --clear            # 清空记录（不删文件）
+```
 
 ### 4.3 配置文件
 
-- 默认：`%APPDATA%\ScreenRec\config.json`，日志在同目录 `logs\screenrec.log`。
+- 默认：`%APPDATA%\ScreenRec\`，其中
+  - `config.json` —— 设置；
+  - `history.json` —— 录制记录（最多 500 条，可直接编辑或删除）；
+  - `logs\screenrec.log` —— 运行日志。
 - **便携模式**：在 `screenrec.exe` 同级放置空文件 `ScreenRec.portable`，
-  配置与日志改存到 `exe目录\ScreenRecData\`。
+  上述文件改存到 `exe目录\ScreenRecData\`。
 - 自动化/测试可用环境变量 `SCREENREC_DATA_DIR=<目录>` 覆盖。
 
 ---
@@ -189,10 +219,12 @@ screenrec record --test-pattern --format mp4 --duration 5 --system-audio
 src/
   main.rs            入口：有子命令走 CLI，否则打开图形界面
   lib.rs             库入口（GUI 与 CLI 共用）
-  cli.rs             命令行：record / sources / formats / probe / frame / doctor
+  cli.rs             命令行：record / history / sources / formats / probe / frame / doctor
   config.rs          配置读写、便携模式、取值范围校验
   formats.rs         容器/编码器/画质能力矩阵（纯数据 + 单元测试）
-  paths.rs           输出目录、文件名模板、去重、合法化
+  paths.rs           输出目录、文件名模板、去重、合法化、在资源管理器中显示
+  history.rs         录制记录：持久化、去重、上限、原子保存、损坏恢复
+  units.rs           时长/大小/中文列宽等显示格式化
   ffmpeg.rs          查找并探测 FFmpeg
   logging.rs         文件日志（写不进去也不影响录制）
   hotkeys.rs         全局快捷键（RegisterHotKey + 独立消息循环）
@@ -216,7 +248,7 @@ src/
     wasapi_capture.rs WASAPI 回环 / 麦克风采集线程
     ring.rs          有界采样环形缓冲
   gui/
-    mod.rs, app.rs, theme.rs, widgets.rs   图形界面（含中文字体加载）
+    mod.rs, app.rs, theme.rs, widgets.rs   图形界面（录制 / 记录 / 设置 / 关于）
 examples/
   dxgi_probe.rs      DXGI 像素格式/内容诊断工具
 scripts/
@@ -231,7 +263,7 @@ scripts/
 ## 7. 测试
 
 ```powershell
-cargo test              # 110 个单元测试
+cargo test              # 125 个单元测试
 screenrec probe         # 实测本机可用的编码器（会真的写出小文件）
 screenrec doctor        # 环境自检
 ```
@@ -247,8 +279,9 @@ screenrec record --test-pattern --duration 2 --fps 5 --format mp4 --output-dir $
 
 单元测试覆盖：格式能力矩阵、画质/码率换算、缩放与偶数化、文件名模板与去重、
 配置迁移与钳制、恒定帧率整形与时间戳、GIF 延时进位、HDR 半精度解码与 sRGB 映射、
-音频环形缓冲与混音（增益/裁剪/静音补齐）、FFmpeg 参数生成、WAV 头、快捷键解析、
-预览缩放、PNG/JPEG 序列写出与编码器能力探测等。
+Media Foundation 行序（避免画面上下翻转）、音频环形缓冲与混音（增益/裁剪/静音补齐）、
+FFmpeg 参数生成、WAV 头、快捷键解析、录制记录的读写/去重/上限/原子保存/损坏恢复、
+中文表格宽度对齐、预览缩放、PNG/JPEG 序列写出与编码器能力探测等。
 
 ---
 

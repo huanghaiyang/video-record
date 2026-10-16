@@ -24,6 +24,7 @@ use crate::audio::{AudioCapture, AudioMixer};
 use crate::config::AppConfig;
 use crate::encode::{self, AudioParams, SinkParams};
 use crate::formats::{self, ExportFormat};
+use crate::history::{EntrySource, HistoryStore, RecordingEntry};
 use crate::paths::{self, PlannedOutput};
 
 /// Lifecycle of one recording.
@@ -273,6 +274,9 @@ pub struct Recorder {
     audio: Option<AudioCapture>,
     output: PlannedOutput,
     format: ExportFormat,
+    /// Details copied into the recording history once the file is written.
+    source_template: EntrySource,
+    history_written: bool,
 }
 
 impl Recorder {
@@ -380,6 +384,21 @@ impl Recorder {
             audio: audio_capture,
             output,
             format,
+            source_template: EntrySource {
+                kind: match &request.source {
+                    SourceSelection::Monitor { .. } => "monitor",
+                    SourceSelection::Window { .. } => "window",
+                    SourceSelection::Picker => "picker",
+                }
+                .to_string(),
+                label: request.source.label(),
+                container: format.container.id().to_string(),
+                codec: format.codec.id().to_string(),
+                frame_rate: fps,
+                // GIF and image sequences have no audio track.
+                audio_capable: format.container.is_video(),
+            },
+            history_written: false,
         })
     }
 
@@ -461,6 +480,42 @@ impl Recorder {
         }
         if let Some(mut audio) = self.audio.take() {
             audio.stop();
+        }
+        self.write_history();
+    }
+
+    /// Appends the finished recording to the history file.
+    ///
+    /// Runs after the sink has closed, so the file size and duration are final.
+    /// Failures here are logged only: a recording that was written is never
+    /// reported as failed just because the history could not be updated.
+    fn write_history(&mut self) {
+        if self.history_written {
+            return;
+        }
+        self.history_written = true;
+
+        if self.shared.status() != SessionStatus::Completed {
+            return;
+        }
+
+        let snapshot = self.shared.snapshot();
+        let Some(entry) = RecordingEntry::from_session(&self.source_template, &snapshot) else {
+            return;
+        };
+
+        let mut store = HistoryStore::load();
+        match store.add(entry) {
+            Ok(id) => log::info!(
+                "已写入录制记录 #{id}（共 {} 条，文件：{}）",
+                store.len(),
+                snapshot
+                    .output
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            ),
+            Err(err) => log::warn!("写入录制记录失败: {err}"),
         }
     }
 }
