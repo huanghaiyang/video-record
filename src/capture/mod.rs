@@ -139,3 +139,6 @@ impl SourceSelection {
         matches!(self, Self::Monitor { .. })
     }
 }
+
+// Re-exported so capture code can keep using `capture::Region`.
+pub use crate::region::Region;

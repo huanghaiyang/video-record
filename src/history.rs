@@ -14,6 +14,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::capture::SessionSnapshot;
+use crate::region::Region;
 
 /// Schema version of the on-disk file.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -38,6 +39,8 @@ pub struct EntrySource {
     pub frame_rate: u32,
     /// False for GIF and image sequences, which cannot carry an audio track.
     pub audio_capable: bool,
+    /// Area that was recorded, when only part of the source was kept.
+    pub region: Option<Region>,
 }
 
 /// One finished recording.
@@ -65,6 +68,9 @@ pub struct RecordingEntry {
     pub output_size: Option<(u32, u32)>,
     #[serde(default)]
     pub audio: String,
+    /// Recorded area, when only part of the source was captured.
+    #[serde(default)]
+    pub region: Option<Region>,
     /// Recomputed on load; never trusted from disk.
     #[serde(skip)]
     pub exists: bool,
@@ -96,8 +102,15 @@ impl RecordingEntry {
             } else {
                 "不适用（该格式没有音轨）".to_string()
             },
+            // The session reports what was really cropped; the request is a fallback.
+            region: snapshot.region.or(source.region),
             exists: true,
         })
+    }
+
+    /// `区域 800×600 @ (100, 200)`, when only part of the source was recorded.
+    pub fn region_text(&self) -> Option<String> {
+        self.region.map(|region| format!("区域 {}", region.label()))
     }
 
     pub fn created_local(&self) -> Option<chrono::DateTime<chrono::Local>> {
@@ -330,6 +343,7 @@ mod tests {
             codec: "h264".to_string(),
             frame_rate: 30,
             audio_capable: true,
+            region: None,
         }
     }
 
@@ -345,7 +359,48 @@ mod tests {
             output_size: Some((1280, 720)),
             backend: "内置编码器 H264".to_string(),
             audio: "系统声音（回环）".to_string(),
+            region: None,
         }
+    }
+
+    #[test]
+    fn a_recorded_area_is_carried_into_the_history() {
+        let mut area = source();
+        area.region = Some(Region::new(100, 200, 800, 600));
+        let entry =
+            RecordingEntry::from_session(&area, &snapshot(Some(PathBuf::from("a.mp4")))).unwrap();
+
+        assert_eq!(entry.region, Some(Region::new(100, 200, 800, 600)));
+        assert_eq!(entry.region_text().unwrap(), "区域 800×600 @ (100, 200)");
+
+        // Whole-source recordings have no region text.
+        let entry =
+            RecordingEntry::from_session(&source(), &snapshot(Some(PathBuf::from("a.mp4"))))
+                .unwrap();
+        assert!(entry.region_text().is_none());
+    }
+
+    #[test]
+    fn regions_survive_the_history_file() {
+        let path = temp_path("region");
+        let _ = std::fs::remove_file(&path);
+        let mut store = HistoryStore::with_path(path.clone());
+
+        let mut area = source();
+        area.region = Some(Region::new(16, 32, 640, 480));
+        store
+            .add(
+                RecordingEntry::from_session(&area, &snapshot(Some(PathBuf::from("a.mp4"))))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let reloaded = HistoryStore::with_path(path.clone());
+        assert_eq!(
+            reloaded.entries()[0].region,
+            Some(Region::new(16, 32, 640, 480))
+        );
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -372,6 +427,21 @@ mod tests {
             RecordingEntry::from_session(&source(), &snapshot(Some(PathBuf::from("a.mp4"))))
                 .unwrap();
         assert_eq!(entry.audio, "系统声音（回环）");
+    }
+
+    #[test]
+    fn the_effective_region_wins_over_the_requested_one() {
+        let mut area = source();
+        // Requested a region that hangs off the source.
+        area.region = Some(Region::new(9000, 9000, 400, 300));
+
+        let mut snap = snapshot(Some(PathBuf::from("a.mp4")));
+        // What the pipeline actually cropped after clamping.
+        snap.region = Some(Region::new(880, 420, 400, 300));
+
+        let entry = RecordingEntry::from_session(&area, &snap).unwrap();
+        assert_eq!(entry.region, Some(Region::new(880, 420, 400, 300)));
+        assert_eq!(entry.region_text().unwrap(), "区域 400×300 @ (880, 420)");
     }
 
     #[test]
@@ -466,6 +536,7 @@ mod tests {
                 source_size: None,
                 output_size: None,
                 audio: String::new(),
+                region: None,
                 exists: false,
             });
         }

@@ -23,6 +23,7 @@ pub mod history;
 pub mod hotkeys;
 pub mod logging;
 pub mod paths;
+pub mod region;
 pub mod units;
 
 pub use capture::sources::WindowInfo;

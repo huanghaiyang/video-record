@@ -3,6 +3,140 @@
 use windows_capture::monitor::Monitor;
 use windows_capture::window::Window;
 
+use crate::region::Region;
+
+/// A monitor as GDI sees it: its position on the virtual desktop and its size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorRect {
+    /// Device name, e.g. `\\.\DISPLAY1`.
+    pub device_name: String,
+    /// Left edge on the virtual desktop, in physical pixels (may be negative).
+    pub x: i32,
+    /// Top edge on the virtual desktop, in physical pixels (may be negative).
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+}
+
+impl MonitorRect {
+    /// Converts two virtual-desktop corners into a region relative to this
+    /// monitor, clamped so the result never leaves it.
+    pub fn region_from_corners(&self, from: (i32, i32), to: (i32, i32)) -> Region {
+        if self.width == 0 || self.height == 0 {
+            return Region::new(0, 0, 0, 0);
+        }
+
+        // Clamp the corners first: clamping only the origin afterwards would
+        // let a drag that starts outside the monitor produce an oversized
+        // region.
+        let clamp_x = |value: i32| value.clamp(self.x, self.x + self.width as i32);
+        let clamp_y = |value: i32| value.clamp(self.y, self.y + self.height as i32);
+
+        let (ax, ay) = (clamp_x(from.0), clamp_y(from.1));
+        let (bx, by) = (clamp_x(to.0), clamp_y(to.1));
+
+        Region {
+            x: (ax.min(bx) - self.x) as u32,
+            y: (ay.min(by) - self.y) as u32,
+            width: (ax - bx).unsigned_abs(),
+            height: (ay - by).unsigned_abs(),
+        }
+    }
+
+    /// True when a virtual-desktop point lies inside this monitor.
+    pub fn contains(&self, point: (i32, i32)) -> bool {
+        point.0 >= self.x
+            && point.0 < self.x + self.width as i32
+            && point.1 >= self.y
+            && point.1 < self.y + self.height as i32
+    }
+}
+
+/// Current cursor position in virtual-desktop physical pixels.
+///
+/// Physical pixels are what `Region` needs, so reading the cursor directly
+/// avoids the logical/DPI conversion a UI toolkit would apply.
+pub fn cursor_position() -> Option<(i32, i32)> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let mut point = POINT::default();
+    match unsafe { GetCursorPos(&mut point) } {
+        Ok(()) => Some((point.x, point.y)),
+        Err(err) => {
+            log::warn!("读取鼠标位置失败: {err}");
+            None
+        }
+    }
+}
+
+/// Monitor containing a virtual-desktop point, falling back to the first one.
+pub fn monitor_at(point: (i32, i32)) -> Option<MonitorRect> {
+    let rects = monitor_rects();
+    rects
+        .iter()
+        .find(|rect| rect.contains(point))
+        .or_else(|| rects.first())
+        .cloned()
+}
+
+/// Lists monitors through GDI, which is the only source of their positions.
+///
+/// `windows-capture` reports sizes and names but not where a monitor sits, and
+/// area recording needs the origin to translate screen coordinates.
+pub fn monitor_rects() -> Vec<MonitorRect> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{LPARAM, RECT, TRUE};
+    use windows::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
+    };
+
+    unsafe extern "system" fn callback(
+        monitor: HMONITOR,
+        _hdc: HDC,
+        _clip: *mut RECT,
+        data: LPARAM,
+    ) -> BOOL {
+        let list = unsafe { &mut *(data.0 as *mut Vec<MonitorRect>) };
+        // GetMonitorInfoW fills an EX structure when cbSize says so, which is
+        // the only way to also learn the device name.
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+
+        if unsafe { GetMonitorInfoW(monitor, &mut info.monitorInfo) }.as_bool() {
+            let end = info.szDevice.iter().position(|c| *c == 0).unwrap_or(info.szDevice.len());
+            let rect = info.monitorInfo.rcMonitor;
+            list.push(MonitorRect {
+                device_name: String::from_utf16_lossy(&info.szDevice[..end]),
+                x: rect.left,
+                y: rect.top,
+                width: (rect.right - rect.left).max(0) as u32,
+                height: (rect.bottom - rect.top).max(0) as u32,
+                is_primary: info.monitorInfo.dwFlags & 1 != 0,
+            });
+        }
+        TRUE
+    }
+
+    let mut list: Vec<MonitorRect> = Vec::new();
+    // SAFETY: the callback only pushes into `list`, which outlives the call.
+    let ok = unsafe {
+        EnumDisplayMonitors(
+            None,
+            None,
+            Some(callback),
+            LPARAM((&mut list as *mut Vec<MonitorRect>) as isize),
+        )
+    };
+
+    if !ok.as_bool() {
+        log::warn!("枚举显示器位置失败");
+    }
+    list.sort_by_key(|monitor| (!monitor.is_primary, monitor.x, monitor.y));
+    list
+}
+
 /// A display that can be recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MonitorInfo {
@@ -17,6 +151,9 @@ pub struct MonitorInfo {
     pub height: u32,
     pub refresh_rate: u32,
     pub is_primary: bool,
+    /// Top-left corner on the virtual desktop, in physical pixels. `(0, 0)`
+    /// when GDI could not be queried.
+    pub position: (i32, i32),
 }
 
 impl MonitorInfo {
@@ -37,12 +174,14 @@ impl MonitorInfo {
             self.name.clone()
         };
         let mut text = format!(
-            "{} — {}x{} @ {}Hz{}",
+            "{} — {}x{} @ {}Hz{} · 桌面位置 ({}, {})",
             name,
             self.width,
             self.height,
             self.refresh_rate,
-            if self.is_primary { "（主）" } else { "" }
+            if self.is_primary { "（主）" } else { "" },
+            self.position.0,
+            self.position.1
         );
         if self.display_index != self.index {
             text.push_str(&format!(" · 系统编号 DISPLAY{}", self.display_index));
@@ -107,6 +246,7 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
                 height: monitor.height().unwrap_or(0),
                 refresh_rate: monitor.refresh_rate().unwrap_or(0),
                 is_primary,
+                position: (0, 0),
             }
         })
         .collect();
@@ -114,6 +254,34 @@ pub fn list_monitors() -> Vec<MonitorInfo> {
     // Present the primary monitor first: it is the common choice and the
     // default selection in the UI.
     infos.sort_by_key(|info| (!info.is_primary, info.index));
+
+    // Attach the desktop position from GDI: `windows-capture` reports sizes and
+    // names but not where a monitor sits, and area recording needs the origin.
+    let rects = monitor_rects();
+    for info in &mut infos {
+        let matched = rects
+            .iter()
+            .find(|rect| !rect.device_name.is_empty() && rect.device_name == info.device_name)
+            .or_else(|| {
+                rects
+                    .iter()
+                    .find(|rect| rect.width == info.width && rect.height == info.height)
+            });
+        if let Some(rect) = matched {
+            info.position = (rect.x, rect.y);
+        }
+    }
+
+    // The primary flag from GDI is authoritative when names did not match.
+    if let Some(primary) = rects.iter().find(|rect| rect.is_primary) {
+        if let Some(info) = infos
+            .iter_mut()
+            .find(|info| (info.width, info.height) == (primary.width, primary.height))
+        {
+            info.is_primary = true;
+        }
+    }
+
     infos
 }
 
@@ -227,6 +395,7 @@ mod tests {
             height: 2160,
             refresh_rate: 60,
             is_primary: true,
+            position: (0, 0),
         };
         assert!(info.label().contains("主显示器"));
         assert!(info.describe().contains("3840x2160"));
@@ -244,8 +413,62 @@ mod tests {
             height: 1080,
             refresh_rate: 60,
             is_primary: false,
+            position: (0, 0),
         };
         assert!(!info.describe().contains("系统编号"));
         assert!(info.describe().contains("DISPLAY1"));
+    }
+
+    #[test]
+    fn monitor_positions_are_readable() {
+        // Every Windows session reports at least one monitor; the point is that
+        // the GDI call succeeds and returns sane geometry.
+        let rects = monitor_rects();
+        if rects.is_empty() {
+            eprintln!("no monitors reported (acceptable in a headless session)");
+            return;
+        }
+        assert!(
+            rects.iter().all(|rect| rect.width > 0 && rect.height > 0),
+            "every monitor must have a non-zero size"
+        );
+        assert_eq!(
+            rects.iter().filter(|rect| rect.is_primary).count(),
+            1,
+            "exactly one monitor is primary"
+        );
+    }
+
+    #[test]
+    fn corners_become_a_region_relative_to_the_monitor() {
+        let monitor = MonitorRect {
+            device_name: r"\\.\DISPLAY2".to_string(),
+            x: 1920,
+            y: -200,
+            width: 2560,
+            height: 1440,
+            is_primary: false,
+        };
+
+        // Dragged left-to-right, top-to-bottom.
+        assert_eq!(
+            monitor.region_from_corners((2020, 100), (2500, 500)),
+            Region::new(100, 300, 480, 400)
+        );
+        // Dragged the other way round gives the same region.
+        assert_eq!(
+            monitor.region_from_corners((2500, 500), (2020, 100)),
+            Region::new(100, 300, 480, 400)
+        );
+        // A drag starting left/above the monitor is clamped into it.
+        assert_eq!(
+            monitor.region_from_corners((1800, -400), (2000, 0)),
+            Region::new(0, 0, 80, 200)
+        );
+
+        assert!(monitor.contains((1920, -200)));
+        assert!(monitor.contains((4479, 1239)));
+        assert!(!monitor.contains((1919, 0)));
+        assert!(!monitor.contains((1920, 1241)));
     }
 }

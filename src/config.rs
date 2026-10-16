@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::capture::CaptureMethod;
+use crate::region::Region;
 use crate::formats::{
     self, AudioCodec, Container, ExportFormat, FormatError, QualityPreset, ScaleOption, VideoCodec,
 };
@@ -178,6 +179,13 @@ pub struct AppConfig {
     // ---- external tools ----
     /// Empty means "detect automatically".
     pub ffmpeg_path: PathBuf,
+
+    /// Record only this part of the captured source (area recording).
+    ///
+    /// Coordinates are relative to the captured monitor or window, in physical
+    /// pixels; `None` records the whole source.
+    #[serde(default)]
+    pub region: Option<Region>,
 }
 
 impl Default for AppConfig {
@@ -212,6 +220,7 @@ impl Default for AppConfig {
             remember_last_source: true,
             last_source: None,
             ffmpeg_path: PathBuf::new(),
+            region: None,
         }
     }
 }
@@ -287,6 +296,11 @@ impl AppConfig {
         };
         if !formats::codecs_for(self.container).contains(&self.video_codec) {
             self.video_codec = formats::codecs_for(self.container)[0];
+        }
+        // A region that is too small (or a stale one) falls back to whole-source
+        // recording rather than failing at capture time.
+        if self.region.is_some_and(|region| !region.is_valid()) {
+            self.region = None;
         }
         if self.hotkey_start_stop.trim().is_empty() {
             self.hotkey_start_stop = "F9".to_string();

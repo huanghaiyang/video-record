@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use super::pacer::Pacer;
 use super::session::{PreviewFrame, SessionShared, SessionStatus};
+use super::Region;
 use crate::audio::AudioMixer;
 use crate::encode::{util, FrameData, FrameSink};
 
@@ -36,6 +37,10 @@ pub struct FramePipeline {
     /// Scratch buffers kept between frames to avoid per-frame allocations.
     staging: Vec<u8>,
     scratch: Vec<u8>,
+    /// Holds the cropped frame when area recording is enabled.
+    crop_scratch: Vec<u8>,
+    /// Area of the captured frame to keep, relative to its top-left corner.
+    crop: Option<Region>,
     /// Copy of the last frame in output format, used to fill gaps when the
     /// source stops producing frames (a static screen).
     duplicate: Vec<u8>,
@@ -66,6 +71,8 @@ impl FramePipeline {
             dst_height: 0,
             staging: Vec::new(),
             scratch: Vec::new(),
+            crop_scratch: Vec::new(),
+            crop: None,
             duplicate: Vec::new(),
             duplicate_valid: false,
             preview_enabled: preview,
@@ -79,6 +86,18 @@ impl FramePipeline {
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// Records only this part of every captured frame.
+    ///
+    /// The crop is applied before the encoder is created, so the output size,
+    /// the scaler and the preview all treat the region as their source.
+    pub fn set_crop(&mut self, crop: Option<Region>) {
+        self.crop = crop;
+    }
+
+    pub fn crop(&self) -> Option<Region> {
+        self.crop
     }
 
     pub fn failure(&self) -> Option<&str> {
@@ -170,6 +189,27 @@ impl FramePipeline {
             "捕获到的画面尺寸无效：{width}x{height}"
         );
 
+        // Area recording: cut the region out first so everything downstream —
+        // encoder size, scaler, preview — sees the region as its source.
+        let mut crop_scratch = std::mem::take(&mut self.crop_scratch);
+        let result = match self.crop {
+            Some(region) => {
+                // Clamp here so a region dragged past the edge is recorded from
+                // the part that exists, and publish what was really used.
+                let region = region.clamp_to(width, height);
+                self.shared.set_region(Some(region));
+                util::crop_bgra(pixels, width, height, region, &mut crop_scratch).and_then(|()| {
+                    self.push_frame(&crop_scratch, region.width, region.height)
+                })
+            }
+            None => self.push_frame(pixels, width, height),
+        };
+        self.crop_scratch = crop_scratch;
+        result
+    }
+
+    /// Runs a ready frame through the sink, the pacing timeline and the preview.
+    fn push_frame(&mut self, pixels: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
         if self.sink.is_none() {
             self.ensure_sink(width, height)?;
         }

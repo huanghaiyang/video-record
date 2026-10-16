@@ -17,6 +17,7 @@ use crate::config::{AppConfig, OutputDirOutcome, SavedSource, ThemeMode};
 use crate::encode::capability::CapabilityMap;
 use crate::ffmpeg::{self, FfmpegInfo};
 use crate::history::HistoryStore;
+use crate::region::Region;
 use crate::formats::{self, AudioCodec, Container, QualityPreset, ScaleOption};
 use crate::hotkeys::{HotkeyAction, HotkeyManager};
 use crate::paths;
@@ -95,6 +96,13 @@ pub struct ScreenRecApp {
     history: HistoryStore,
     selected_entry: Option<u64>,
     confirm_clear_history: bool,
+
+    /// Area-recording controls. The fields keep their values while the feature
+    /// is switched off so toggling it back restores what was entered.
+    region_enabled: bool,
+    region_fields: Region,
+    /// First corner picked with "取左上角", in virtual-desktop pixels.
+    region_corner: Option<(i32, i32)>,
 }
 
 impl ScreenRecApp {
@@ -105,6 +113,8 @@ impl ScreenRecApp {
         super::theme::apply_style(&cc.egui_ctx, config.theme);
 
         let ffmpeg = ffmpeg::detect(&config.ffmpeg_path);
+        // Read before `config` is moved into the struct below.
+        let saved_region = config.region;
 
         let mut app = Self {
             config,
@@ -133,6 +143,9 @@ impl ScreenRecApp {
             history: HistoryStore::load(),
             selected_entry: None,
             confirm_clear_history: false,
+            region_enabled: saved_region.is_some(),
+            region_fields: saved_region.unwrap_or(Region::new(0, 0, 640, 360)),
+            region_corner: None,
         };
 
         app.refresh_sources();
@@ -173,6 +186,10 @@ impl ScreenRecApp {
     }
 
     fn touch_config(&mut self) {
+        // The region lives in two places while editing: the checkbox plus the
+        // numeric fields here, and `Some(region)` in the config. Keeping them in
+        // step in one place avoids a mismatch when the recording starts.
+        self.config.region = self.effective_region();
         self.config_dirty = true;
         self.last_config_change = Instant::now();
     }
@@ -653,6 +670,8 @@ impl ScreenRecApp {
             self.info("已选择“系统选择器”，点击开始录制后会弹出选择框");
         }
 
+        self.region_controls(ui);
+
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(6.0);
@@ -667,6 +686,157 @@ impl ScreenRecApp {
             }
             None => hint(ui, "尚未选择"),
         }
+        if let Some(region) = self.effective_region() {
+            ui.label(
+                RichText::new(format!("只录制区域 {}", region.label()))
+                    .color(colors::ACCENT)
+                    .small(),
+            );
+        }
+    }
+
+    /// Area-recording controls: numeric fields plus picking the two corners
+    /// with the mouse, which is pixel-exact because the cursor is read in
+    /// physical screen coordinates.
+    fn region_controls(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+
+        ui.horizontal(|ui| {
+            if ui
+                .checkbox(&mut self.region_enabled, "只录制一块区域")
+                .on_hover_text("只编码所选矩形内的画面，坐标相对于所录显示器/窗口的左上角")
+                .changed()
+            {
+                self.region_corner = None;
+                self.touch_config();
+            }
+        });
+
+        if !self.region_enabled {
+            return;
+        }
+
+        let mut fields = self.region_fields;
+        let mut changed = false;
+
+        egui::Grid::new("region_fields")
+            .num_columns(4)
+            .spacing([6.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("X");
+                changed |= ui.add(egui::DragValue::new(&mut fields.x).range(0..=32_768)).changed();
+                ui.label("Y");
+                changed |= ui.add(egui::DragValue::new(&mut fields.y).range(0..=32_768)).changed();
+                ui.end_row();
+
+                ui.label("宽");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut fields.width).range(Region::MIN_SIZE..=32_768))
+                    .changed();
+                ui.label("高");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut fields.height).range(Region::MIN_SIZE..=32_768))
+                    .changed();
+                ui.end_row();
+            });
+
+        if changed {
+            self.region_fields = fields;
+            self.touch_config();
+        }
+
+        ui.horizontal(|ui| {
+            let has_corner = self.region_corner.is_some();
+            if ui
+                .button("取第一角")
+                .on_hover_text("把鼠标移到区域的一个角，然后点这里")
+                .clicked()
+            {
+                match crate::capture::sources::cursor_position() {
+                    Some(point) => {
+                        self.region_corner = Some(point);
+                        self.info(format!("已记录第一个角：({}, {})，请把鼠标移到对角再点“取对角”", point.0, point.1));
+                    }
+                    None => self.error("无法读取鼠标位置"),
+                }
+            }
+            if ui
+                .add_enabled(has_corner, egui::Button::new("取对角"))
+                .on_hover_text("把鼠标移到区域的另一个角，然后点这里")
+                .clicked()
+            {
+                self.finish_region_pick();
+            }
+            if ui.button("重置为全屏").clicked() {
+                self.region_enabled = false;
+                self.region_corner = None;
+                self.touch_config();
+            }
+        });
+
+        if self.region_corner.is_some() {
+            hint(ui, "已记住第一个角；移动鼠标后点“取对角”完成选择（Esc 可取消）");
+        }
+
+        // Warn when the region reaches past the source, since capture clamps it.
+        if let Some((width, height)) = self.current_source_size() {
+            if self.region_fields.right() > width || self.region_fields.bottom() > height {
+                ui.label(
+                    RichText::new(format!(
+                        "⚠ 区域超出画面 {width}×{height}，录制时会被裁剪到边界内"
+                    ))
+                    .color(colors::WARN)
+                    .small(),
+                );
+            }
+        }
+    }
+
+    /// Turns the remembered corner plus the current cursor into a region.
+    fn finish_region_pick(&mut self) {
+        let Some(from) = self.region_corner.take() else {
+            return;
+        };
+        let Some(to) = crate::capture::sources::cursor_position() else {
+            self.error("无法读取鼠标位置");
+            return;
+        };
+
+        // The region is relative to the monitor the first corner sits on, which
+        // is the monitor the user was pointing at.
+        let Some(monitor) = crate::capture::sources::monitor_at(from) else {
+            self.error("找不到鼠标所在的显示器");
+            return;
+        };
+
+        let region = monitor.region_from_corners(from, to);
+        if !region.is_valid() {
+            self.error(format!(
+                "选中的区域太小（{}），宽高至少 {} 像素",
+                region.label(),
+                Region::MIN_SIZE
+            ));
+            return;
+        }
+
+        self.region_fields = region;
+        self.region_enabled = true;
+        self.touch_config();
+        self.success(format!("已选择区域 {}", region.label()));
+    }
+
+    /// The region that will actually be recorded.
+    fn effective_region(&self) -> Option<Region> {
+        self.region_enabled.then_some(self.region_fields)
+    }
+
+    /// Size of the currently selected capture source, when known.
+    fn current_source_size(&self) -> Option<(u32, u32)> {
+        self.source
+            .as_ref()
+            .and_then(|source| source_resolution(source, &self.monitors, &self.windows))
     }
 
     fn monitor_list(&mut self, ui: &mut egui::Ui) {
@@ -1339,6 +1509,9 @@ impl ScreenRecApp {
                 widgets::key_value(ui, "文件", entry.file_name());
                 widgets::key_value(ui, "完整路径", entry.path.display().to_string());
                 widgets::key_value(ui, "分辨率", entry.resolution_text());
+                if let Some(region) = entry.region_text() {
+                    widgets::key_value(ui, "录制区域", region);
+                }
                 widgets::key_value(ui, "声音", entry.audio.clone());
                 widgets::key_value(ui, "编码器", entry.backend.clone());
                 widgets::key_value(ui, "大小", crate::units::format_size(entry.bytes));

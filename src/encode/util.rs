@@ -7,11 +7,49 @@ pub fn bgra_to_rgba_in_place(data: &mut [u8]) {
     }
 }
 
+use crate::region::Region;
+
 /// Copies a BGRA buffer, swapping red/blue, into an RGBA `Vec`.
 pub fn bgra_to_rgba(src: &[u8], out: &mut Vec<u8>) {
     out.clear();
     out.extend_from_slice(src);
     bgra_to_rgba_in_place(out);
+}
+
+/// Copies a region out of a tightly packed BGRA frame.
+///
+/// Used for area recording: cropping before the encoder means the output size,
+/// the scaler and the preview all work on the region as if it were the source.
+pub fn crop_bgra(
+    src: &[u8],
+    src_width: u32,
+    src_height: u32,
+    region: Region,
+    out: &mut Vec<u8>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(region.width > 0 && region.height > 0, "裁剪尺寸不能为 0");
+    anyhow::ensure!(
+        region.right() <= src_width && region.bottom() <= src_height,
+        "裁剪区域 {} 超出画面 {src_width}x{src_height}",
+        region.label()
+    );
+
+    let src_stride = (src_width as usize) * 4;
+    let row_bytes = (region.width as usize) * 4;
+    let expected = (src_height as usize) * src_stride;
+    anyhow::ensure!(
+        src.len() >= expected,
+        "帧数据不完整：{} < {expected}",
+        src.len()
+    );
+
+    out.clear();
+    out.reserve(row_bytes * region.height as usize);
+    for row in 0..region.height as usize {
+        let start = (region.y as usize + row) * src_stride + (region.x as usize) * 4;
+        out.extend_from_slice(&src[start..start + row_bytes]);
+    }
+    Ok(())
 }
 
 /// Reverses the row order of a tightly packed BGRA frame.
@@ -212,6 +250,51 @@ mod tests {
         let mut back = Vec::new();
         rgba_to_bgra(&rgba, &mut back);
         assert_eq!(back, bgra);
+    }
+
+    #[test]
+    fn cropping_picks_the_requested_rows_and_columns() {
+        // 4x3 frame, every pixel encodes its own coordinates.
+        let (width, height) = (4u32, 3u32);
+        let mut src = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                src.extend_from_slice(&[x as u8, y as u8, 0, 255]);
+            }
+        }
+
+        let mut out = Vec::new();
+        crop_bgra(&src, width, height, Region::new(1, 1, 2, 2), &mut out).unwrap();
+
+        // Expect pixels (1,1) (2,1) (1,2) (2,2) in that order.
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert_eq!(&out[0..4], &[1, 1, 0, 255]);
+        assert_eq!(&out[4..8], &[2, 1, 0, 255]);
+        assert_eq!(&out[8..12], &[1, 2, 0, 255]);
+        assert_eq!(&out[12..16], &[2, 2, 0, 255]);
+    }
+
+    #[test]
+    fn cropping_the_whole_frame_is_identity() {
+        let (width, height) = (5u32, 4u32);
+        let src: Vec<u8> = (0..(width * height * 4)).map(|i| (i % 251) as u8).collect();
+
+        let mut out = Vec::new();
+        crop_bgra(&src, width, height, Region::full(width, height), &mut out).unwrap();
+        assert_eq!(out, src);
+    }
+
+    #[test]
+    fn cropping_outside_the_frame_fails_instead_of_reading_garbage() {
+        let (width, height) = (4u32, 4u32);
+        let src = vec![9u8; (width * height * 4) as usize];
+        let mut out = Vec::new();
+
+        assert!(crop_bgra(&src, width, height, Region::new(3, 0, 2, 1), &mut out).is_err());
+        assert!(crop_bgra(&src, width, height, Region::new(0, 3, 1, 2), &mut out).is_err());
+        assert!(crop_bgra(&src, width, height, Region::new(0, 0, 0, 4), &mut out).is_err());
+        // A truncated buffer must be detected, not sliced out of bounds.
+        assert!(crop_bgra(&src[..8], width, height, Region::full(4, 4), &mut out).is_err());
     }
 
     #[test]

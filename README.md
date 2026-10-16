@@ -20,6 +20,12 @@
   HDR→SDR 转换（16 位浮点 → sRGB）。
 - **单个窗口录制**：列出所有可捕获的顶层窗口（标题、进程、尺寸、前台标记），
   支持按标题/进程名过滤，也可直接用窗口句柄（`0x…`）。
+- **区域录制**：只录制画面中的一块矩形（例如只录游戏画面、只录聊天窗口内容而不含边框）。
+  坐标以物理像素计、相对所录显示器/窗口的左上角：
+  - 界面上可直接填 X/Y/宽/高，或用「取第一角 → 移动鼠标 → 取对角」的方式框选
+    （直接读鼠标的物理坐标，不受 DPI 缩放影响）；
+  - 命令行用 `--region 100,200,800,600` 或 `--region 800x600+100+200`；
+  - 区域超出画面时自动钳制到边界内，并在录制记录里写下**实际**使用的区域。
 - **系统选择器**：调用 Windows 自带的「图形捕获选择器」，鼠标点选窗口或屏幕。
 - 记住上次使用的录制源；目标窗口被关闭时自动结束并保存。
 
@@ -155,6 +161,12 @@ screenrec record --monitor 1 --duration 10 --fps 30 --scale 720p --system-audio
 screenrec record --window "记事本" --duration 30 --format mkv
 screenrec record --window 0x105BA --duration 30 --format mp4
 
+# 只录屏幕的一块区域（两种写法等价；坐标相对所录显示器左上角）
+screenrec record --monitor 1 --region "100,200,800,600" --duration 30
+screenrec record --monitor 1 --region "800x600+100+200" --duration 30
+# 也可以裁一个窗口（只录窗口画面的一部分）
+screenrec record --window "记事本" --region "0,0,400,300" --duration 10
+
 # 使用系统选择器，手动停止（Ctrl+C）
 screenrec record --picker --duration 0
 
@@ -222,6 +234,7 @@ src/
   cli.rs             命令行：record / history / sources / formats / probe / frame / doctor
   config.rs          配置读写、便携模式、取值范围校验
   formats.rs         容器/编码器/画质能力矩阵（纯数据 + 单元测试）
+  region.rs          区域录制用的矩形：解析、钳制、坐标换算
   paths.rs           输出目录、文件名模板、去重、合法化、在资源管理器中显示
   history.rs         录制记录：持久化、去重、上限、原子保存、损坏恢复
   units.rs           时长/大小/中文列宽等显示格式化
@@ -230,8 +243,8 @@ src/
   hotkeys.rs         全局快捷键（RegisterHotKey + 独立消息循环）
   capture/
     mod.rs           采集源枚举与采集方式
-    sources.rs       显示器/窗口枚举
-    pipeline.rs      帧管线：编码器懒创建、恒定帧率整形、音视频对齐、预览
+    sources.rs       显示器/窗口枚举（含 GDI 桌面位置与鼠标坐标）
+    pipeline.rs      帧管线：区域裁剪、编码器懒创建、恒定帧率整形、音视频对齐、预览
     handler.rs       Windows Graphics Capture 回调（薄适配层）
     dxgi.rs          DXGI 桌面复制采集循环（含 HDR→SDR）
     screenshot.rs    单帧截图
@@ -263,7 +276,7 @@ scripts/
 ## 7. 测试
 
 ```powershell
-cargo test              # 125 个单元测试
+cargo test              # 141 个单元测试
 screenrec probe         # 实测本机可用的编码器（会真的写出小文件）
 screenrec doctor        # 环境自检
 ```
@@ -277,7 +290,7 @@ screenrec record --test-pattern --duration 2 --fps 5 --format mp4 --output-dir $
 .\.tools\ffmpeg\bin\ffmpeg.exe -y -i "$env:TEMP\sr\*.mp4" -frames:v 1 frame.png
 ```
 
-单元测试覆盖：格式能力矩阵、画质/码率换算、缩放与偶数化、文件名模板与去重、
+单元测试覆盖：区域解析/钳制/坐标换算/裁剪、格式能力矩阵、画质/码率换算、缩放与偶数化、文件名模板与去重、
 配置迁移与钳制、恒定帧率整形与时间戳、GIF 延时进位、HDR 半精度解码与 sRGB 映射、
 Media Foundation 行序（避免画面上下翻转）、音频环形缓冲与混音（增益/裁剪/静音补齐）、
 FFmpeg 参数生成、WAV 头、快捷键解析、录制记录的读写/去重/上限/原子保存/损坏恢复、

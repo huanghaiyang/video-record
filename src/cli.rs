@@ -15,6 +15,7 @@ use crate::ffmpeg;
 use crate::formats::{self, Container, QualityPreset, ScaleOption, VideoCodec};
 use crate::history::HistoryStore;
 use crate::logging;
+use crate::region::Region;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -136,6 +137,11 @@ pub struct RecordArgs {
     #[arg(long)]
     pub capture: Option<String>,
 
+    /// 只录制所选源的一块区域，如 100,200,800,600 或 800x600+100+200
+    /// （坐标相对于所录显示器/窗口的左上角，单位为物理像素）
+    #[arg(long)]
+    pub region: Option<String>,
+
     /// 不采集屏幕，改用内置测试图案验证编码与封装
     #[arg(long)]
     pub test_pattern: bool,
@@ -244,6 +250,9 @@ fn record(args: RecordArgs) -> anyhow::Result<()> {
     let source = resolve_source(&args)?;
 
     println!("捕获目标：{}", capture::session::describe_source(&source));
+    if let Some(region) = config.region {
+        println!("录制区域：{}（相对于该目标左上角）", region.label());
+    }
     println!(
         "导出格式：{}",
         config
@@ -405,6 +414,9 @@ fn apply_overrides(config: &mut AppConfig, args: &RecordArgs) -> anyhow::Result<
         config.capture_method = CaptureMethod::from_id(method)
             .ok_or_else(|| anyhow::anyhow!("未知的采集方式：{method}（可用 auto / wgc / dxgi）"))?;
     }
+    if let Some(spec) = &args.region {
+        config.region = Some(Region::parse(spec).map_err(|err| anyhow::anyhow!(err))?);
+    }
     if args.test_pattern {
         config.test_pattern = true;
     }
@@ -548,6 +560,7 @@ fn history(args: HistoryArgs) -> anyhow::Result<()> {
                     "source_size": entry.source_size,
                     "output_size": entry.output_size,
                     "audio": entry.audio,
+                    "region": entry.region,
                     "exists": entry.exists,
                 })
             })
@@ -589,7 +602,10 @@ fn history(args: HistoryArgs) -> anyhow::Result<()> {
     let indent = " ".repeat(60);
     for entry in store.entries().iter().take(limit) {
         let status = if entry.exists { "正常" } else { "文件丢失" };
-        let title = format!("{} · {}", entry.source_label, entry.file_name());
+        let mut title = format!("{} · {}", entry.source_label, entry.file_name());
+        if let Some(region) = entry.region_text() {
+            title.push_str(&format!(" · {region}"));
+        }
         println!(
             "{} {} {} {} {} {title}",
             crate::units::pad_display(&entry.created_text(), 20),
@@ -987,6 +1003,7 @@ mod tests {
             ffmpeg: None,
             countdown: 0,
             capture: Some("dxgi".into()),
+            region: Some("100,200,640,480".into()),
             test_pattern: false,
             json: false,
         };
@@ -1028,9 +1045,58 @@ mod tests {
             ffmpeg: None,
             countdown: 0,
             capture: None,
+            region: None,
             test_pattern: false,
             json: false,
         };
         assert!(apply_overrides(&mut config, &args).is_err());
+    }
+
+    #[test]
+    fn region_flag_is_parsed_and_rejects_bad_input() {
+        let mut config = AppConfig::default();
+
+        let mut args = RecordArgs {
+            monitor: None,
+            window: None,
+            picker: false,
+            duration: 1,
+            format: None,
+            codec: None,
+            fps: None,
+            quality: None,
+            bitrate_kbps: None,
+            output_dir: None,
+            filename: None,
+            scale: None,
+            max_width: None,
+            no_cursor: false,
+            border: false,
+            system_audio: false,
+            no_audio: false,
+            mic: false,
+            ffmpeg: None,
+            countdown: 0,
+            capture: None,
+            region: Some("800x600+100+200".into()),
+            test_pattern: false,
+            json: false,
+        };
+        apply_overrides(&mut config, &args).unwrap();
+        assert_eq!(config.region, Some(Region::new(100, 200, 800, 600)));
+
+        // Both notations must agree.
+        args.region = Some("100,200,800,600".into());
+        apply_overrides(&mut config, &args).unwrap();
+        assert_eq!(config.region, Some(Region::new(100, 200, 800, 600)));
+
+        // Bad input is reported instead of silently recording the whole screen.
+        args.region = Some("nonsense".into());
+        assert!(apply_overrides(&mut config, &args).is_err());
+
+        // No flag keeps whatever the config had.
+        args.region = None;
+        apply_overrides(&mut config, &args).unwrap();
+        assert_eq!(config.region, Some(Region::new(100, 200, 800, 600)));
     }
 }

@@ -26,6 +26,7 @@ use crate::encode::{self, AudioParams, SinkParams};
 use crate::formats::{self, ExportFormat};
 use crate::history::{EntrySource, HistoryStore, RecordingEntry};
 use crate::paths::{self, PlannedOutput};
+use crate::region::Region;
 
 /// Lifecycle of one recording.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -86,6 +87,8 @@ pub struct SessionSnapshot {
     pub output_size: Option<(u32, u32)>,
     pub backend: String,
     pub audio: String,
+    /// Area that was actually recorded, after clamping to the frame size.
+    pub region: Option<Region>,
 }
 
 /// State shared between the UI thread, the capture thread and the encoder.
@@ -104,6 +107,7 @@ pub struct SessionShared {
     output_size: Mutex<Option<(u32, u32)>>,
     backend: Mutex<String>,
     audio: Mutex<String>,
+    region: Mutex<Option<Region>>,
     preview: Mutex<Option<PreviewFrame>>,
 }
 
@@ -129,6 +133,7 @@ impl SessionShared {
             output_size: Mutex::new(None),
             backend: Mutex::new(String::new()),
             audio: Mutex::new(String::new()),
+            region: Mutex::new(None),
             preview: Mutex::new(None),
         }
     }
@@ -185,6 +190,13 @@ impl SessionShared {
     pub fn set_backend(&self, backend: impl Into<String>) {
         if let Ok(mut value) = self.backend.lock() {
             *value = backend.into();
+        }
+    }
+
+    /// Records the effective area once the first frame has been cropped.
+    pub fn set_region(&self, region: Option<Region>) {
+        if let Ok(mut current) = self.region.lock() {
+            *current = region;
         }
     }
 
@@ -254,6 +266,7 @@ impl SessionShared {
             output_size: *self.output_size.lock().unwrap_or_else(|e| e.into_inner()),
             backend: self.backend.lock().map(|v| v.clone()).unwrap_or_default(),
             audio: self.audio.lock().map(|v| v.clone()).unwrap_or_default(),
+            region: *self.region.lock().unwrap_or_else(|e| e.into_inner()),
         }
     }
 }
@@ -355,6 +368,7 @@ impl Recorder {
             options: CaptureOptions::from_config(&config),
             method: config.capture_method,
             test_pattern: config.test_pattern,
+            region: config.region,
         };
         let source = request.source.clone();
         let thread_shared = Arc::clone(&shared);
@@ -397,6 +411,7 @@ impl Recorder {
                 frame_rate: fps,
                 // GIF and image sequences have no audio track.
                 audio_capable: format.container.is_video(),
+                region: config.region,
             },
             history_written: false,
         })
@@ -576,6 +591,8 @@ struct CaptureJob {
     method: CaptureMethod,
     /// Feed synthetic frames instead of capturing the screen.
     test_pattern: bool,
+    /// Area to keep from every captured frame.
+    region: Option<Region>,
 }
 
 /// Size of the synthetic test pattern.
@@ -591,9 +608,11 @@ fn run_test_pattern(
     fps: u32,
     audio: Option<AudioMixer>,
     preview: bool,
+    region: Option<Region>,
 ) -> anyhow::Result<()> {
     let (width, height) = TEST_PATTERN_SIZE;
     let mut pipeline = FramePipeline::new(factory, Arc::clone(&shared), fps, audio, preview);
+    pipeline.set_crop(region);
     let period = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
     let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
 
@@ -667,15 +686,31 @@ fn draw_test_pattern(pixels: &mut [u8], width: u32, height: u32, index: u64) {
 /// Runs the capture. Graphics Capture takes over the calling thread; the DXGI
 /// loop uses it as a normal worker thread.
 fn run_capture(source: SourceSelection, job: CaptureJob) -> anyhow::Result<()> {
-    let CaptureJob { factory, shared, fps, audio, preview, options, method, test_pattern } = job;
+    let CaptureJob {
+        factory,
+        shared,
+        fps,
+        audio,
+        preview,
+        options,
+        method,
+        test_pattern,
+        region,
+    } = job;
 
     // A synthetic source keeps the whole pipeline testable without touching the
     // screen: `screenrec record --test-pattern`.
     if test_pattern {
-        return run_test_pattern(factory, shared, fps, audio, preview);
+        return run_test_pattern(factory, shared, fps, audio, preview, region);
     }
 
-    let pipeline = FramePipeline::new(factory, Arc::clone(&shared), fps, audio, preview);
+    let mut pipeline = FramePipeline::new(factory, Arc::clone(&shared), fps, audio, preview);
+    // Area recording: the crop is applied to every frame before the encoder
+    // sees it, so all backends behave identically.
+    pipeline.set_crop(region);
+    if let Some(region) = region {
+        log::info!("区域录制：{}", region.label());
+    }
 
     match source {
         SourceSelection::Monitor { index, .. } => match method {
