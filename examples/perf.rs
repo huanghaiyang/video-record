@@ -84,116 +84,94 @@ fn main() {
     let rgba16 = vec![0u8; pixels * 8];
 
     let mut out_bgra = Vec::new();
-    let hdr = bench("HDR: Rgba16F → BGRA (scRGB→sRGB)", 5, || {
+    let hdr = bench("HDR: Rgba16F → BGRA (scRGB→sRGB)", 15, || {
         util::hdr_fp16_to_bgra(&rgba16, &mut out_bgra);
     });
-    let hdr_rows = bench("HDR: 同上，按行并行", 5, || {
+    let hdr_rows = bench("HDR: 同上，按行并行", 15, || {
         util::hdr_fp16_to_bgra_rows(&rgba16, width, &mut out_bgra);
     });
 
     let mut out_crop = Vec::new();
-    let crop = bench("区域裁剪 → 800x600", 10, || {
+    let crop = bench("区域裁剪 → 800x600", 30, || {
         util::crop_bgra(&bgra, width, height, Region::new(100, 100, 800, 600), &mut out_crop)
             .unwrap();
     });
 
     let mut out_flip = Vec::new();
-    let flip = bench("MF 行序翻转（自下而上）", 10, || {
+    let flip = bench("MF 行序翻转（自下而上）", 30, || {
         util::flip_vertical(&bgra, width, height, &mut out_flip);
     });
 
     let mut scratch = Vec::new();
     let mut out_scale = Vec::new();
     let scale_1080 = if height > 1080 {
-        bench("缩放 → 1920x1080（Triangle）", 5, || {
+        bench("缩放 → 1920x1080（Triangle）", 15, || {
             util::scale_bgra(&bgra, width, height, 1920, 1080, &mut scratch, &mut out_scale).unwrap();
         })
     } else {
         Duration::ZERO
     };
     let scale_720 = if height > 720 {
-        bench("缩放 → 1280x720（Triangle）", 5, || {
+        bench("缩放 → 1280x720（Triangle）", 15, || {
             util::scale_bgra(&bgra, width, height, 1280, 720, &mut scratch, &mut out_scale).unwrap();
         })
     } else {
         Duration::ZERO
     };
 
-    // ---- whole pipeline, preview on/off -------------------------------
-    println!("\n整条管线（含恒定帧率整形、预览、补帧缓存，编码器为空实现）：");
+    // ---- whole pipeline -------------------------------------------------
+    // Frames arrive at the source refresh rate while the recording targets a
+    // possibly lower fps: that is the case the "drop frames that are not due"
+    // path exists for. Only the CPU time of the push itself is accumulated,
+    // not the simulated interval between frames.
+    println!("\n整条管线（模拟 60 Hz 采集源，编码器为空实现，只统计 CPU 时间）：");
 
-    let run_pipeline = |label: &str,
-                        preview: bool,
-                        crop: Option<Region>,
-                        target: Option<(u32, u32)>,
-                        frames: u32| {
+    let run_paced = |label: &str,
+                     target_fps: u32,
+                     crop: Option<Region>,
+                     target: Option<(u32, u32)>,
+                     source_frames: u32| {
         let shared = Arc::new(SessionShared::new());
         let mut pipeline =
-            FramePipeline::new(null_factory(target), Arc::clone(&shared), fps, None, preview);
+            FramePipeline::new(null_factory(target), Arc::clone(&shared), target_fps, None, true);
         pipeline.set_crop(crop);
-        // Warm up, then measure.
-        for _ in 0..2 {
+        let interval = Duration::from_micros(1_000_000 / 60);
+        let mut cpu = Duration::ZERO;
+        for _ in 0..source_frames {
+            let start = Instant::now();
             pipeline.push_bgra(&bgra, width, height).unwrap();
+            cpu += start.elapsed();
+            std::thread::sleep(interval);
         }
-        let start = Instant::now();
-        for _ in 0..frames {
-            pipeline.push_bgra(&bgra, width, height).unwrap();
-        }
-        let elapsed = start.elapsed();
-        let per_frame = elapsed / frames;
-        let budget = Duration::from_secs_f64(1.0 / fps as f64);
+        let emitted = pipeline.emitted_frames();
+        let per_source = cpu / source_frames;
         println!(
-            "  {label:<44} {:>9.3} ms/帧   ({:.0}% of {fps} fps budget)",
-            per_frame.as_secs_f64() * 1_000.0,
-            per_frame.as_secs_f64() / budget.as_secs_f64() * 100.0
+            "  {label:<34} {:>8.3} ms/源帧   CPU 合计 {:>6.1} ms/{:.1}s  输出 {} 帧",
+            per_source.as_secs_f64() * 1_000.0,
+            cpu.as_secs_f64() * 1_000.0,
+            source_frames as f64 / 60.0,
+            emitted
         );
-        per_frame
+        per_source
     };
 
-    let frames = 60;
-    let plain = run_pipeline("原尺寸，预览关", false, None, None, frames);
-    let with_preview = run_pipeline("原尺寸，预览开", true, None, None, frames);
-    let with_crop = run_pipeline(
-        "区域 800x600，预览开",
-        true,
+    let source_frames = 60;
+    run_paced("4K 全屏 → 30 fps", 30, None, None, source_frames);
+    run_paced("4K 全屏 → 60 fps", 60, None, None, source_frames);
+    run_paced("4K → 1080p，30 fps", 30, None, Some((1920, 1080)), source_frames);
+    run_paced(
+        "4K 区域 800x600 → 30 fps",
+        30,
         Some(Region::new(100, 100, 800, 600)),
         None,
-        frames,
+        source_frames,
     );
-    let scaled_1080 = if height > 1080 {
-        run_pipeline("缩放 1920x1080，预览开", true, None, Some((1920, 1080)), frames)
-    } else {
-        Duration::ZERO
-    };
-    let scaled_720 = if height > 720 {
-        run_pipeline("缩放 1280x720，预览开", true, None, Some((1280, 720)), frames)
-    } else {
-        Duration::ZERO
-    };
 
-    // ---- how much of that is the preview ------------------------------
-    // Saturating: run-to-run noise can make a "more work" variant measure faster.
-    let diff = |a: Duration, b: Duration| {
-        a.checked_sub(b).unwrap_or_default().as_secs_f64() * 1_000.0
-    };
-    println!("\n汇总（每帧）：");
-    println!("  预览开销            {:>8.3} ms", diff(with_preview, plain));
+    println!("\n汇总（单帧 CPU）：");
     println!(
-        "  区域裁剪净开销      {:>8.3} ms",
-        diff(with_crop, with_preview)
-    );
-    println!(
-        "  缩放到 1080p 净开销 {:>8.3} ms",
-        diff(scaled_1080, with_preview)
-    );
-    println!(
-        "  缩放到 720p  净开销 {:>8.3} ms",
-        diff(scaled_720, with_preview)
-    );
-    println!(
-        "  HDR 转换（单帧）    {:>8.3} ms  (并行 {:>.3} ms)",
-        hdr.as_secs_f64() * 1_000.0,
-        hdr_rows.as_secs_f64() * 1_000.0
+        "  HDR 转换            {:>8.3} ms  (单线程 {:.3} ms)",
+        hdr_rows.as_secs_f64() * 1_000.0,
+        hdr.as_secs_f64() * 1_000.0
     );
     println!(
         "  裁剪 / 翻转 / 缩放   {:>8.3} / {:.3} / {:.3} ms",
@@ -202,7 +180,7 @@ fn main() {
         scale_1080.max(scale_720).as_secs_f64() * 1_000.0
     );
 
-    // ---- what the numbers mean for a whole second of recording --------
+    // ---- what the numbers mean for a frame budget ----------------------
     let budget = Duration::from_secs_f64(1.0 / fps as f64);
     for (label, cost) in [("HDR 转换", hdr_rows), ("缩放到 1080p", scale_1080)] {
         if cost.is_zero() {
@@ -211,7 +189,7 @@ fn main() {
         let share = cost.as_secs_f64() / budget.as_secs_f64() * 100.0;
         println!(
             "  {label} 占 {fps} fps 单帧预算的 {share:.0}%{}",
-            if share > 100.0 { "  ← 单线程无法达标" } else { "" }
+            if share > 100.0 { "  <- 单线程无法达标" } else { "" }
         );
     }
 }

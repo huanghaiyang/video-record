@@ -188,51 +188,6 @@ impl FramePipeline {
             width > 0 && height > 0,
             "捕获到的画面尺寸无效：{width}x{height}"
         );
-
-        // Area recording: cut the region out first so everything downstream —
-        // encoder size, scaler, preview — sees the region as its source.
-        let mut crop_scratch = std::mem::take(&mut self.crop_scratch);
-        let result = match self.crop {
-            Some(region) => {
-                // Clamp here so a region dragged past the edge is recorded from
-                // the part that exists, and publish what was really used.
-                let region = region.clamp_to(width, height);
-                self.shared.set_region(Some(region));
-                util::crop_bgra(pixels, width, height, region, &mut crop_scratch).and_then(|()| {
-                    self.push_frame(&crop_scratch, region.width, region.height)
-                })
-            }
-            None => self.push_frame(pixels, width, height),
-        };
-        self.crop_scratch = crop_scratch;
-        result
-    }
-
-    /// Runs a ready frame through the sink, the pacing timeline and the preview.
-    fn push_frame(&mut self, pixels: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
-        if self.sink.is_none() {
-            self.ensure_sink(width, height)?;
-        }
-
-        if self.check_pause() {
-            return Ok(());
-        }
-
-        // Take buffers out of `self` so they can be borrowed next to the other
-        // fields of the pipeline.
-        let mut staging = std::mem::take(&mut self.staging);
-        let result = self.push_inner(pixels, width, height, &mut staging);
-        self.staging = staging;
-        result
-    }
-
-    fn push_inner(
-        &mut self,
-        pixels: &[u8],
-        width: u32,
-        height: u32,
-        staging: &mut Vec<u8>,
-    ) -> anyhow::Result<()> {
         let expected = (width as usize) * (height as usize) * 4;
         anyhow::ensure!(
             pixels.len() >= expected,
@@ -242,18 +197,73 @@ impl FramePipeline {
         );
         let source = &pixels[..expected];
 
-        self.update_preview(source, width, height);
+        // Area recording: the region is resolved first because it also decides
+        // the encoder's size. Clamping here means a region dragged past the edge
+        // still records the part that exists.
+        let region = self.crop.map(|region| {
+            let clamped = region.clamp_to(width, height);
+            self.shared.set_region(Some(clamped));
+            clamped
+        });
+        let (source_width, source_height) =
+            region.map_or((width, height), |region| (region.width, region.height));
 
-        // Produce the final output-sized frame (a no-op in the common case).
-        if source.len() == (self.dst_width as usize) * (self.dst_height as usize) * 4
-            && width == self.dst_width
-            && height == self.dst_height
-        {
+        if self.sink.is_none() {
+            self.ensure_sink(source_width, source_height)?;
+        }
+
+        if self.check_pause() {
+            return Ok(());
+        }
+
+        // Drop frames the timeline does not need *before* transforming them: a
+        // 60 Hz source recording at 30 fps would otherwise crop, scale and
+        // convert every single frame only to throw half of them away.
+        let elapsed = self.pacer.elapsed();
+        self.shared.set_elapsed(elapsed);
+        if self.pacer.frames_due(elapsed) <= self.pacer.emitted() {
+            return Ok(());
+        }
+
+        let mut crop_scratch = std::mem::take(&mut self.crop_scratch);
+        let result = match region {
+            Some(region) => util::crop_bgra(source, width, height, region, &mut crop_scratch)
+                .and_then(|()| {
+                    self.publish(&crop_scratch, region.width, region.height)
+                }),
+            None => self.publish(source, width, height),
+        };
+        self.crop_scratch = crop_scratch;
+        result
+    }
+
+    /// Scales a ready frame, emits everything the timeline owes and updates the
+    /// preview.
+    fn publish(&mut self, pixels: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
+        self.update_preview(pixels, width, height);
+
+        // Take the buffer out of `self` so it can be borrowed next to the other
+        // fields of the pipeline.
+        let mut staging = std::mem::take(&mut self.staging);
+        let result = self.publish_inner(pixels, width, height, &mut staging);
+        self.staging = staging;
+        result
+    }
+
+    fn publish_inner(
+        &mut self,
+        pixels: &[u8],
+        width: u32,
+        height: u32,
+        staging: &mut Vec<u8>,
+    ) -> anyhow::Result<()> {
+        // Produce the final output-sized frame (a plain copy in the common case).
+        if width == self.dst_width && height == self.dst_height {
             staging.clear();
-            staging.extend_from_slice(source);
+            staging.extend_from_slice(pixels);
         } else {
             util::scale_bgra(
-                source,
+                pixels,
                 width,
                 height,
                 self.dst_width,
@@ -265,12 +275,18 @@ impl FramePipeline {
 
         let frame_width = self.dst_width;
         let frame_height = self.dst_height;
-        let elapsed = self.pacer.elapsed();
-        self.shared.set_elapsed(elapsed);
-
-        let due = self.pacer.frames_due(elapsed);
+        let due = self.pacer.frames_due(self.pacer.elapsed());
+        let before = self.pacer.emitted();
         while self.pacer.emitted() < due {
             self.emit(staging, frame_width, frame_height)?;
+        }
+
+        if self.pacer.emitted() != before {
+            // Keep the finished frame for gap filling by *handing over* the
+            // buffer instead of copying it again; `staging` gets the previous
+            // frame's allocation back and reuses it next time.
+            std::mem::swap(&mut self.duplicate, staging);
+            self.duplicate_valid = true;
         }
 
         if matches!(self.shared.status(), SessionStatus::Preparing) {
@@ -280,19 +296,10 @@ impl FramePipeline {
     }
 
     /// Writes one output frame from already final-sized pixels.
+    ///
+    /// Relies on data that is already owned by the pipeline (`staging` or
+    /// `duplicate`); every sink copies what it needs before returning.
     fn emit(&mut self, pixels: &[u8], width: u32, height: u32) -> anyhow::Result<()> {
-        self.emit_inner(pixels, width, height, true)
-    }
-
-    /// `remember` is false when the pixels already *are* the remembered frame
-    /// (the gap-filling path), which avoids copying a whole frame per filler.
-    fn emit_inner(
-        &mut self,
-        pixels: &[u8],
-        width: u32,
-        height: u32,
-        remember: bool,
-    ) -> anyhow::Result<()> {
         let index = self.pacer.emitted();
         let frame = FrameData {
             pixels,
@@ -315,13 +322,9 @@ impl FramePipeline {
             }
         }
 
-        // Remember this frame so a stalled source can still extend the
-        // recording timeline instead of truncating it.
-        if remember {
-            self.duplicate.clear();
-            self.duplicate.extend_from_slice(pixels);
-            self.duplicate_valid = true;
-        }
+        // Remembering the frame for gap filling is the caller's job
+        // (`publish_inner` hands the buffer over; `tick` already owns it), so
+        // nothing is copied here.
 
         self.pacer.advance();
         self.shared.bump_frames();
@@ -352,8 +355,9 @@ impl FramePipeline {
         let result = (|| -> anyhow::Result<()> {
             let due = self.pacer.frames_due(elapsed);
             while self.pacer.emitted() < due {
-                // Already the remembered frame: do not copy it back onto itself.
-                self.emit_inner(&duplicate, width, height, false)?;
+                // These pixels already are the remembered frame, so nothing is
+                // copied: the timeline is simply extended with them.
+                self.emit(&duplicate, width, height)?;
             }
             Ok(())
         })();
@@ -475,6 +479,210 @@ fn make_preview(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::region::Region;
+    use std::sync::Mutex;
+
+    /// One frame as the sink saw it.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Captured {
+        width: u32,
+        height: u32,
+        timestamp: i64,
+        /// First byte of the frame, used to tell frames apart.
+        marker: u8,
+    }
+
+    struct CaptureSink {
+        frames: Arc<Mutex<Vec<Captured>>>,
+    }
+
+    impl FrameSink for CaptureSink {
+        fn push(&mut self, frame: &FrameData<'_>) -> anyhow::Result<()> {
+            self.frames.lock().unwrap().push(Captured {
+                width: frame.width,
+                height: frame.height,
+                timestamp: frame.timestamp_100ns,
+                marker: frame.pixels.first().copied().unwrap_or(0),
+            });
+            Ok(())
+        }
+
+        fn finish(self: Box<Self>) -> anyhow::Result<std::path::PathBuf> {
+            Ok(std::path::PathBuf::from("test"))
+        }
+
+        fn describe(&self) -> String {
+            "测试编码器".to_string()
+        }
+    }
+
+    fn capture_factory(
+        target: Option<(u32, u32)>,
+        frames: Arc<Mutex<Vec<Captured>>>,
+    ) -> SinkFactory {
+        Box::new(move |width: u32, height: u32| {
+            let (out_width, out_height) = target.unwrap_or((width, height));
+            Ok((
+                Box::new(CaptureSink { frames }) as Box<dyn FrameSink>,
+                out_width,
+                out_height,
+            ))
+        })
+    }
+
+    fn frame(marker: u8, width: u32, height: u32) -> Vec<u8> {
+        vec![marker; (width * height * 4) as usize]
+    }
+
+    /// Builds a pipeline plus the list its sink writes into.
+    fn pipeline(
+        fps: u32,
+        crop: Option<Region>,
+        target: Option<(u32, u32)>,
+    ) -> (FramePipeline, Arc<Mutex<Vec<Captured>>>) {
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let shared = Arc::new(SessionShared::new());
+        let mut pipeline = FramePipeline::new(
+            capture_factory(target, Arc::clone(&frames)),
+            shared,
+            fps,
+            None,
+            false,
+        );
+        pipeline.set_crop(crop);
+        (pipeline, frames)
+    }
+
+    #[test]
+    fn frames_that_are_not_due_yet_are_dropped() {
+        // 20 fps means one frame every 50 ms; pushing in a tight loop must not
+        // produce frames, which is what makes the early-out worth having.
+        let (mut pipeline, frames) = pipeline(20, None, None);
+        for _ in 0..50 {
+            pipeline.push_bgra(&frame(0xAA, 32, 32), 32, 32).unwrap();
+        }
+        assert_eq!(pipeline.emitted_frames(), 0);
+        assert!(frames.lock().unwrap().is_empty());
+
+        // Once the timeline is due, the next frame fills in the gaps.
+        std::thread::sleep(Duration::from_millis(120));
+        pipeline.push_bgra(&frame(0xAA, 32, 32), 32, 32).unwrap();
+
+        let captured = frames.lock().unwrap().clone();
+        assert!(
+            (2..=3).contains(&captured.len()),
+            "expected the owed frames, got {}",
+            captured.len()
+        );
+        // All of them carry the frame that was just pushed.
+        assert!(captured.iter().all(|item| item.marker == 0xAA));
+        // Timestamps follow the timeline, not the arrival order of pushes.
+        for (index, item) in captured.iter().enumerate() {
+            assert_eq!(item.timestamp, index as i64 * 10_000_000 / 20);
+        }
+    }
+
+    #[test]
+    fn a_stalled_source_is_filled_with_the_last_frame() {
+        let (mut pipeline, frames) = pipeline(20, None, None);
+
+        // The first frame starts the timeline, so nothing is due yet; a second
+        // frame after a pause produces at least one output frame.
+        pipeline.push_bgra(&frame(0xBB, 32, 32), 32, 32).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        pipeline.push_bgra(&frame(0xBB, 32, 32), 32, 32).unwrap();
+        let after_push = pipeline.emitted_frames();
+        assert!(after_push >= 1, "the second frame should be emitted");
+
+        // Then silence: `tick` has to extend the timeline.
+        std::thread::sleep(Duration::from_millis(150));
+        pipeline.tick().unwrap();
+
+        let captured = frames.lock().unwrap().clone();
+        assert!(
+            captured.len() as u64 > after_push,
+            "tick must add frames for the stall"
+        );
+        // Every filler must repeat the remembered frame — and in particular not
+        // contain leftovers of a recycled buffer.
+        assert!(
+            captured.iter().all(|item| item.marker == 0xBB),
+            "filler frames must repeat the last frame: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn the_remembered_frame_follows_the_newest_content() {
+        // Guards the buffer hand-over: the frame kept for gap filling must be
+        // the newest one, not the buffer that was swapped out.
+        let (mut pipeline, frames) = pipeline(20, None, None);
+
+        std::thread::sleep(Duration::from_millis(60));
+        pipeline.push_bgra(&frame(0x11, 32, 32), 32, 32).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        pipeline.push_bgra(&frame(0x22, 32, 32), 32, 32).unwrap();
+
+        frames.lock().unwrap().clear();
+        std::thread::sleep(Duration::from_millis(120));
+        pipeline.tick().unwrap();
+
+        let captured = frames.lock().unwrap().clone();
+        assert!(!captured.is_empty(), "tick must extend the timeline");
+        assert!(
+            captured.iter().all(|item| item.marker == 0x22),
+            "gap filling must use the newest frame: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn cropping_sizes_the_output_and_keeps_the_region_content() {
+        // 64x64 frame where every pixel encodes its own column, cropped to
+        // columns 8..24 and rows 8..24.
+        let (mut pipeline, frames) = pipeline(20, Some(Region::new(8, 8, 16, 16)), None);
+
+        let mut source = vec![0u8; 64 * 64 * 4];
+        for y in 0..64usize {
+            for x in 0..64usize {
+                let offset = (y * 64 + x) * 4;
+                source[offset] = x as u8;
+                source[offset + 1] = y as u8;
+                source[offset + 3] = 255;
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(60));
+        pipeline.push_bgra(&source, 64, 64).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        pipeline.push_bgra(&source, 64, 64).unwrap();
+
+        let captured = frames.lock().unwrap().clone();
+        assert!(!captured.is_empty());
+        assert_eq!((captured[0].width, captured[0].height), (16, 16));
+        // The sink only sees the region, so its first pixel is the region's
+        // top-left corner: column 8, row 8.
+        assert_eq!(captured[0].marker, 8);
+    }
+
+    #[test]
+    fn scaling_uses_the_sink_size() {
+        let (mut pipeline, frames) = pipeline(20, None, Some((16, 16)));
+        pipeline.push_bgra(&frame(0x33, 64, 64), 64, 64).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        pipeline.push_bgra(&frame(0x33, 64, 64), 64, 64).unwrap();
+
+        let captured = frames.lock().unwrap().clone();
+        assert!(!captured.is_empty());
+        assert_eq!((captured[0].width, captured[0].height), (16, 16));
+        assert_eq!(captured[0].marker, 0x33);
+    }
+
+    #[test]
+    fn an_incomplete_frame_is_rejected_before_any_work() {
+        let (mut pipeline, frames) = pipeline(20, None, None);
+        assert!(pipeline.push_bgra(&[], 32, 32).is_err());
+        assert!(pipeline.push_bgra(&[0u8; 16], 32, 32).is_err());
+        assert!(frames.lock().unwrap().is_empty());
+    }
 
     fn bgra_frame(width: u32, height: u32) -> Vec<u8> {
         let mut data = Vec::with_capacity((width * height * 4) as usize);
