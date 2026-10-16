@@ -1,0 +1,76 @@
+[package]
+name = "screenrec"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Screen recorder for Windows: full-screen or single-window capture with multi-format export"
+license = "MIT"
+readme = "README.md"
+default-run = "screenrec"
+
+[[bin]]
+name = "screenrec"
+path = "src/main.rs"
+
+[dependencies]
+# ---- GUI -------------------------------------------------------------------
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "x11",
+    "clipboard",
+    "links",
+] }
+egui = "0.37"
+rfd = { version = "0.17", default-features = false, features = ["common-controls-v6"] }
+
+# ---- capture ---------------------------------------------------------------
+windows-capture = "2.0.1"
+
+# ---- configuration ---------------------------------------------------------
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+# ---- exports ---------------------------------------------------------------
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "bmp",
+    "tiff",
+] }
+gif = "0.14"
+color_quant = "2"
+
+# ---- utilities -------------------------------------------------------------
+anyhow = "1"
+thiserror = "2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossbeam-channel = "0.5"
+clap = { version = "4", features = ["derive"] }
+dirs = "7"
+opener = "0.9"
+log = "0.4"
+ctrlc = "3.5"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.26"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

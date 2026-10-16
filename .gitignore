@@ -1,0 +1,23 @@
+# Rust build output
+/target
+
+# Repository-local toolchain + registry cache (see scripts/env.ps1)
+/.toolchain
+/.setup
+
+# Downloaded tools (FFmpeg and friends)
+/.tools
+
+# Local application data when SCREENREC_DATA_DIR points here
+/.appdata
+
+# Local recordings produced while testing
+/out
+/recordings
+
+# Editor / OS noise
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini

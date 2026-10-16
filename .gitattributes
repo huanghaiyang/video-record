@@ -1,0 +1,19 @@
+# Line-ending policy, so the repository content does not depend on each
+# developer's `core.autocrlf` setting.
+
+# Everything is stored as LF...
+* text=auto eol=lf
+
+# ...except Windows scripts, which are checked out with CRLF.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Never normalise binaries (kept for future bundled assets).
+*.exe binary
+*.dll binary
+*.zip binary
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
