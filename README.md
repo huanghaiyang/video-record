@@ -116,7 +116,9 @@ crates.io 的 HTTP 桥接，全部落在仓库内部（`.toolchain/`），不污
 
 ```powershell
 cargo build --release
-# 产物：target\release\screenrec.exe
+# 产物：
+#   target\release\screenrec.exe       图形界面（GUI 子系统，双击不会弹出控制台）
+#   target\release\screenrec-cli.exe  同参数的命令行版本（控制台程序，脚本请用这个）
 ```
 
 图标由 `build.rs` 嵌入 exe，需要 Windows SDK 的 `rc.exe`；没有时构建照常成功，只是 exe 无文件图标。
@@ -166,9 +168,20 @@ cargo run --release --example make_icon
 
 ### 4.2 命令行
 
+程序有两个可执行文件，参数完全相同：
+
+| 可执行文件 | 子系统 | 用途 |
+| --- | --- | --- |
+| `screenrec.exe` | GUI（Windows） | **双击启动图形界面，永远不会弹出控制台窗口**；带参数时也能当命令行用 |
+| `screenrec-cli.exe` | 控制台 | **脚本/自动化请用这个**：shell 会等它结束，输出与退出码都能正常捕获 |
+
+> 为什么分成两个：把界面程序链接成 GUI 子系统（这正是「不弹控制台」的前提）后，
+> Windows 会让 shell **不等待**它结束，输出捕获也会变成竞态。所以命令行另出一个控制台版本，
+> 两者共用同一套代码与参数。
+
 ```text
 screenrec                      # 图形界面
-screenrec record   [选项]      # 录制
+screenrec record   [选项]      # 录制（screenrec-cli 同）
 screenrec history  [选项]      # 查看/管理录制记录
 screenrec sources  [--json]    # 列出显示器与窗口
 screenrec formats              # 列出导出格式与后端

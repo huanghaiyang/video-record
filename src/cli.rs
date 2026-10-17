@@ -222,6 +222,43 @@ pub fn run(command: Command) -> anyhow::Result<()> {
     }
 }
 
+/// Runs the command line interface and returns the process exit code.
+///
+/// Shared by both binaries:
+///
+/// * `screenrec.exe` is linked as a Windows GUI binary, so launching the
+///   application never opens a console window. A shell does not wait for such a
+///   process, which makes this path fine for ad-hoc use but not for scripts.
+/// * `screenrec-cli.exe` is a console binary: the shell blocks until it exits and
+///   its output is captured normally. That is the one to call from scripts.
+pub fn main_entry() -> i32 {
+    use clap::CommandFactory as _;
+    use std::io::Write as _;
+
+    let cli = Cli::parse();
+    let Some(command) = cli.command else {
+        // The console build has no GUI to fall back to, so explain what to do.
+        let mut help = Cli::command();
+        let _ = help.print_help();
+        println!();
+        let _ = writeln!(
+            std::io::stderr(),
+            "提示：图形界面请运行 screenrec.exe（不带参数）"
+        );
+        return 2;
+    };
+
+    match run(command) {
+        Ok(()) => 0,
+        Err(err) => {
+            // Not `eprintln!`: a GUI-subsystem process may have no usable
+            // stderr, and a failed write would panic over the real message.
+            let _ = writeln!(std::io::stderr(), "错误：{err:#}");
+            1
+        }
+    }
+}
+
 // ---------------------------------------------------------------- record ----
 
 fn record(args: RecordArgs) -> anyhow::Result<()> {

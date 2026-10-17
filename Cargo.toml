@@ -9,8 +9,16 @@ readme = "README.md"
 default-run = "screenrec"
 
 [[bin]]
+# GUI build: linked as a Windows GUI binary so launching it never opens a
+# console window. Also accepts the CLI arguments for ad-hoc use.
 name = "screenrec"
 path = "src/main.rs"
+
+[[bin]]
+# Console build: identical arguments, but a console subsystem binary so shells
+# wait for it and output can be captured. This is the one for scripts.
+name = "screenrec-cli"
+path = "src/bin/screenrec-cli.rs"
 
 [dependencies]
 # ---- GUI -------------------------------------------------------------------
