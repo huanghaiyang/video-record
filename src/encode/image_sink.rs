@@ -162,6 +162,7 @@ mod tests {
                 width: 8,
                 height: 4,
                 timestamp_100ns: frame * 2_000_000,
+                row_order: crate::encode::RowOrder::TopDown,
             })?;
         }
         let result = sink.finish()?;

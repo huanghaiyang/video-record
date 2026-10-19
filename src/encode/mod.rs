@@ -16,15 +16,32 @@ use std::path::PathBuf;
 
 use crate::formats::{AudioCodec, Container, ExportFormat, VideoCodec};
 
+/// Row order of the pixels handed to a sink.
+///
+/// Media Foundation reads RGB buffers bottom-up, everything else here wants
+/// top-down. Letting the sink declare it means the pipeline can *produce* the
+/// requested order — flipping while it copies a frame anyway — instead of making
+/// the sink flip a second full-frame copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowOrder {
+    /// Row 0 is the top of the image (the capture format).
+    #[default]
+    TopDown,
+    /// Row 0 is the bottom of the image; Media Foundation's expectation.
+    BottomUp,
+}
+
 /// One captured frame in the format produced by the capture backend.
 #[derive(Debug, Clone, Copy)]
 pub struct FrameData<'a> {
-    /// BGRA, top-down, no row padding, `width * height * 4` bytes.
+    /// BGRA, no row padding, `width * height * 4` bytes.
     pub pixels: &'a [u8],
     pub width: u32,
     pub height: u32,
     /// Presentation time in 100 ns units, relative to the first frame.
     pub timestamp_100ns: i64,
+    /// Row order of `pixels`, matching [`FrameSink::row_order`].
+    pub row_order: RowOrder,
 }
 
 /// Audio format the sink must accept.
@@ -50,6 +67,11 @@ pub struct SinkParams {
 pub trait FrameSink: Send {
     /// Writes one frame.
     fn push(&mut self, frame: &FrameData<'_>) -> anyhow::Result<()>;
+
+    /// Row order the sink wants frames in; the pipeline produces this order.
+    fn row_order(&self) -> RowOrder {
+        RowOrder::TopDown
+    }
 
     /// Writes interleaved 16-bit PCM matching [`SinkParams::audio`].
     fn push_audio(&mut self, _pcm: &[u8]) -> anyhow::Result<()> {

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::encode::{self, FrameData, FrameSink, SinkParams, SinkRequest};
+use crate::encode::{self, FrameData, FrameSink, RowOrder, SinkParams, SinkRequest};
 use crate::formats::{self, Container, QualityPreset, ScaleOption, VideoCodec};
 use crate::paths::PlannedOutput;
 
@@ -196,7 +196,22 @@ fn push_probe_frames(
             }
         }
         let timestamp = (index as i64 * 10_000_000) / i64::from(fps.max(1));
-        sink.push(&FrameData { pixels: &pixels, width, height, timestamp_100ns: timestamp })?;
+        // This probe feeds the sink directly, so it honours the requested order.
+        let mut flipped = Vec::new();
+        let pixels = match sink.row_order() {
+            RowOrder::TopDown => &pixels,
+            RowOrder::BottomUp => {
+                crate::encode::util::flip_vertical(&pixels, width, height, &mut flipped);
+                &flipped
+            }
+        };
+        sink.push(&FrameData {
+            pixels,
+            width,
+            height,
+            timestamp_100ns: timestamp,
+            row_order: sink.row_order(),
+        })?;
     }
     Ok(())
 }

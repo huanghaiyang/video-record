@@ -11,7 +11,7 @@ use windows_capture::encoder::{
     VideoEncoder, VideoSettingsBuilder, VideoSettingsSubType,
 };
 
-use super::{AudioParams, FrameData, FrameSink, SinkParams};
+use super::{AudioParams, FrameData, FrameSink, RowOrder, SinkParams};
 use crate::encode::util;
 use crate::formats::{AudioCodec, Container, VideoCodec};
 use crate::paths::PlannedOutput;
@@ -128,6 +128,12 @@ impl NativeVideoSink {
 }
 
 impl FrameSink for NativeVideoSink {
+    /// Media Foundation expects RGB buffers bottom-up, so the pipeline hands
+    /// them over already flipped and this sink can send them as-is.
+    fn row_order(&self) -> RowOrder {
+        RowOrder::BottomUp
+    }
+
     fn push(&mut self, frame: &FrameData<'_>) -> anyhow::Result<()> {
         let expected = (self.width as usize) * (self.height as usize) * 4;
         anyhow::ensure!(
@@ -143,19 +149,28 @@ impl FrameSink for NativeVideoSink {
             "帧大小不匹配: 收到 {} 字节，期望 {expected} 字节",
             frame.pixels.len()
         );
+        let pixels = &frame.pixels[..expected];
 
-        let mut mf_frame = std::mem::take(&mut self.mf_frame);
-        prepare_mf_frame(
-            &frame.pixels[..expected],
-            self.width,
-            self.height,
-            &mut mf_frame,
-        );
-        let result = self
-            .encoder()?
-            .send_frame_buffer(&mf_frame, frame.timestamp_100ns);
-        self.mf_frame = mf_frame;
-        result.map_err(Into::into)
+        match frame.row_order {
+            // Already in the order Media Foundation wants: no copy at all here.
+            // (`send_frame_buffer` copies once internally, which cannot be
+            // avoided through this API.)
+            RowOrder::BottomUp => self
+                .encoder()?
+                .send_frame_buffer(pixels, frame.timestamp_100ns)
+                .map_err(Into::into),
+            // Anything that produced top-down pixels (a scaled frame, say) is
+            // flipped here instead.
+            RowOrder::TopDown => {
+                let mut mf_frame = std::mem::take(&mut self.mf_frame);
+                prepare_mf_frame(pixels, self.width, self.height, &mut mf_frame);
+                let result = self
+                    .encoder()?
+                    .send_frame_buffer(&mf_frame, frame.timestamp_100ns);
+                self.mf_frame = mf_frame;
+                result.map_err(Into::into)
+            }
+        }
     }
 
     fn push_audio(&mut self, pcm: &[u8]) -> anyhow::Result<()> {

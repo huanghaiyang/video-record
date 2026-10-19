@@ -13,7 +13,7 @@ use super::pacer::Pacer;
 use super::session::{PreviewFrame, SessionShared, SessionStatus};
 use super::Region;
 use crate::audio::AudioMixer;
-use crate::encode::{util, FrameData, FrameSink};
+use crate::encode::{util, FrameData, FrameSink, RowOrder};
 
 /// Builds the encoder once the capture size is known.
 ///
@@ -45,12 +45,69 @@ pub struct FramePipeline {
     /// source stops producing frames (a static screen).
     duplicate: Vec<u8>,
     duplicate_valid: bool,
+    /// Row order of what currently sits in `staging`/`duplicate`, which is
+    /// whatever the sink asked for.
+    row_order: RowOrder,
     preview_enabled: bool,
     preview_pixels: Vec<u8>,
     last_preview: Instant,
     pause_started: Option<Instant>,
     failure: Option<String>,
     finished: bool,
+    stats: Stats,
+}
+
+/// Per-frame counters, reported periodically so a stuttering recording can be
+/// diagnosed from the log instead of guessed at.
+///
+/// The numbers answer the three questions that matter when the output looks like
+/// a slideshow: how fast frames actually arrive, how many output frames are
+/// repeats, and how long the per-frame work (including the encoder) takes.
+#[derive(Debug, Default)]
+struct Stats {
+    /// Frames handed to the pipeline.
+    pushed: u64,
+    /// Frames dropped before any processing because the timeline did not need
+    /// them (the source runs faster than the target frame rate).
+    skipped_not_due: u64,
+    /// Frames that went through crop/scale/encode.
+    processed: u64,
+    /// Output frames written, and how many of them were gap fillers.
+    emitted: u64,
+    fills: u64,
+    /// Time spent in the per-frame work, and inside the encoder specifically.
+    work: Duration,
+    encode: Duration,
+    max_encode: Duration,
+    /// Snapshot of the counters at the previous report.
+    reported_at: Option<Instant>,
+    reported: StatsSnapshot,
+}
+
+/// Counters as of the last report, so the periodic line can show rates.
+#[derive(Debug, Default, Clone, Copy)]
+struct StatsSnapshot {
+    pushed: u64,
+    skipped_not_due: u64,
+    processed: u64,
+    emitted: u64,
+    fills: u64,
+    work: Duration,
+    encode: Duration,
+}
+
+impl Stats {
+    fn snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            pushed: self.pushed,
+            skipped_not_due: self.skipped_not_due,
+            processed: self.processed,
+            emitted: self.emitted,
+            fills: self.fills,
+            work: self.work,
+            encode: self.encode,
+        }
+    }
 }
 
 impl FramePipeline {
@@ -75,12 +132,14 @@ impl FramePipeline {
             crop: None,
             duplicate: Vec::new(),
             duplicate_valid: false,
+            row_order: RowOrder::TopDown,
             preview_enabled: preview,
             preview_pixels: Vec::new(),
             last_preview: Instant::now(),
             pause_started: None,
             failure: None,
             finished: false,
+            stats: Stats::default(),
         }
     }
 
@@ -221,10 +280,14 @@ impl FramePipeline {
         // convert every single frame only to throw half of them away.
         let elapsed = self.pacer.elapsed();
         self.shared.set_elapsed(elapsed);
+        self.stats.pushed += 1;
         if self.pacer.frames_due(elapsed) <= self.pacer.emitted() {
+            self.stats.skipped_not_due += 1;
+            self.report_stats(false);
             return Ok(());
         }
 
+        let started = Instant::now();
         let mut crop_scratch = std::mem::take(&mut self.crop_scratch);
         let result = match region {
             Some(region) => util::crop_bgra(source, width, height, region, &mut crop_scratch)
@@ -234,7 +297,81 @@ impl FramePipeline {
             None => self.publish(source, width, height),
         };
         self.crop_scratch = crop_scratch;
+        if result.is_ok() {
+            self.stats.processed += 1;
+            self.stats.work += started.elapsed();
+        }
+        self.report_stats(false);
         result
+    }
+
+    /// Logs a periodic summary and warns when the source cannot keep up.
+    ///
+    /// A recording that looks like a slideshow is almost always gap filling:
+    /// fewer distinct frames arrive than the target frame rate needs, so the
+    /// timeline is padded with repeats. These counters make that visible.
+    fn report_stats(&mut self, final_report: bool) {
+        const INTERVAL: Duration = Duration::from_secs(2);
+
+        let now = Instant::now();
+        let Some(previous_time) = self.stats.reported_at else {
+            // First call only starts the reporting window.
+            self.stats.reported_at = Some(now);
+            self.stats.reported = self.stats.snapshot();
+            return;
+        };
+        let elapsed = now.saturating_duration_since(previous_time);
+        if elapsed.is_zero() || (!final_report && elapsed < INTERVAL) {
+            return;
+        }
+
+        let before = self.stats.reported;
+        let after = self.stats.snapshot();
+        let seconds = elapsed.as_secs_f64();
+        let delta = |now: u64, then: u64| now.saturating_sub(then);
+        let emitted = delta(after.emitted, before.emitted);
+        let fills = delta(after.fills, before.fills);
+        let processed = delta(after.processed, before.processed);
+        let pushed = delta(after.pushed, before.pushed);
+
+        let per_frame = |total: Duration, count: u64| {
+            if count == 0 {
+                0.0
+            } else {
+                total.as_secs_f64() * 1_000.0 / count as f64
+            }
+        };
+        let work_ms = per_frame(after.work.saturating_sub(before.work), processed);
+        let encode_ms = per_frame(after.encode.saturating_sub(before.encode), emitted);
+
+        let fps_of = |count: u64| count as f64 / seconds.max(0.001);
+        log::info!(
+            "录制统计：采集 {:.1} fps（{} 帧，跳过 {} 帧）· 输出 {:.1} fps（{} 帧，其中补帧 {}）· \
+             单帧处理 {:.1} ms · 编码 {:.1} ms（峰值 {:.1} ms）",
+            fps_of(pushed),
+            pushed,
+            delta(after.skipped_not_due, before.skipped_not_due),
+            fps_of(emitted),
+            emitted,
+            fills,
+            work_ms,
+            encode_ms,
+            self.stats.max_encode.as_secs_f64() * 1_000.0,
+        );
+
+        // More than a third of the output being repeats means the pipeline (or
+        // the source) cannot sustain the requested frame rate.
+        if emitted > 0 && fills * 3 > emitted {
+            let percent = fills as f64 / emitted as f64 * 100.0;
+            log::warn!(
+                "采集跟不上目标帧率：约 {percent:.0}% 的输出帧是重复帧，画面会像幻灯片。\
+                 建议：降低帧率、把输出缩放到 1080p、关闭显示器 HDR，或改用硬件编码器。"
+            );
+        }
+
+        self.stats.reported = after;
+        self.stats.reported_at = Some(now);
+        self.stats.max_encode = Duration::ZERO;
     }
 
     /// Scales a ready frame, emits everything the timeline owes and updates the
@@ -257,10 +394,26 @@ impl FramePipeline {
         height: u32,
         staging: &mut Vec<u8>,
     ) -> anyhow::Result<()> {
-        // Produce the final output-sized frame (a plain copy in the common case).
+        // Produce the final output-sized frame in the order the sink wants.
+        // When the sink needs bottom-up rows (Media Foundation) the flip is fused
+        // into this copy instead of costing a second full-frame pass.
+        let bottom_up = self
+            .sink
+            .as_ref()
+            .map(|sink| sink.row_order() == RowOrder::BottomUp)
+            .unwrap_or(false);
         if width == self.dst_width && height == self.dst_height {
-            staging.clear();
-            staging.extend_from_slice(pixels);
+            if bottom_up {
+                util::flip_vertical(pixels, width, height, staging);
+            } else {
+                staging.clear();
+                staging.extend_from_slice(pixels);
+            }
+            self.row_order = if bottom_up {
+                RowOrder::BottomUp
+            } else {
+                RowOrder::TopDown
+            };
         } else {
             util::scale_bgra(
                 pixels,
@@ -271,6 +424,8 @@ impl FramePipeline {
                 &mut self.scratch,
                 staging,
             )?;
+            // The scaler always writes top-down; the sink flips if it needs to.
+            self.row_order = RowOrder::TopDown;
         }
 
         let frame_width = self.dst_width;
@@ -306,13 +461,22 @@ impl FramePipeline {
             width,
             height,
             timestamp_100ns: self.pacer.timestamp_100ns(index),
+            row_order: self.row_order,
         };
 
         let sink = self
             .sink
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("编码器尚未创建"))?;
+
+        // Time the encoder separately: it is the only part of the per-frame work
+        // that happens outside this crate's control, so a slideshow can be told
+        // apart from a slow encoder.
+        let encode_started = Instant::now();
         sink.push(&frame)?;
+        let encode_time = encode_started.elapsed();
+        self.stats.encode += encode_time;
+        self.stats.max_encode = self.stats.max_encode.max(encode_time);
 
         if let Some(audio) = self.audio.as_mut() {
             let fps = self.pacer.fps();
@@ -326,6 +490,7 @@ impl FramePipeline {
         // (`publish_inner` hands the buffer over; `tick` already owns it), so
         // nothing is copied here.
 
+        self.stats.emitted += 1;
         self.pacer.advance();
         self.shared.bump_frames();
         Ok(())
@@ -358,10 +523,12 @@ impl FramePipeline {
                 // These pixels already are the remembered frame, so nothing is
                 // copied: the timeline is simply extended with them.
                 self.emit(&duplicate, width, height)?;
+                self.stats.fills += 1;
             }
             Ok(())
         })();
         self.duplicate = duplicate;
+        self.report_stats(false);
         result
     }
 
@@ -371,6 +538,7 @@ impl FramePipeline {
             return;
         }
         self.finished = true;
+        self.report_stats(true);
 
         if !matches!(self.shared.status(), SessionStatus::Failed(_)) {
             self.shared.set_status(SessionStatus::Stopping);
