@@ -72,9 +72,14 @@ struct Stats {
     skipped_not_due: u64,
     /// Frames that went through crop/scale/encode.
     processed: u64,
-    /// Output frames written, and how many of them were gap fillers.
+    /// Output frames written, and how many of them repeat the previous frame.
+    ///
+    /// Repeats come from two places and both must be counted, otherwise a
+    /// recording that duplicates frames to hold the frame rate looks healthy:
+    /// * catch-up inside one push (the timeline was behind by several frames),
+    /// * gap filling from [`FramePipeline::tick`] (the source stopped delivering).
     emitted: u64,
-    fills: u64,
+    repeated: u64,
     /// Time spent in the per-frame work, and inside the encoder specifically.
     work: Duration,
     encode: Duration,
@@ -91,7 +96,7 @@ struct StatsSnapshot {
     skipped_not_due: u64,
     processed: u64,
     emitted: u64,
-    fills: u64,
+    repeated: u64,
     work: Duration,
     encode: Duration,
 }
@@ -103,7 +108,7 @@ impl Stats {
             skipped_not_due: self.skipped_not_due,
             processed: self.processed,
             emitted: self.emitted,
-            fills: self.fills,
+            repeated: self.repeated,
             work: self.work,
             encode: self.encode,
         }
@@ -330,7 +335,7 @@ impl FramePipeline {
         let seconds = elapsed.as_secs_f64();
         let delta = |now: u64, then: u64| now.saturating_sub(then);
         let emitted = delta(after.emitted, before.emitted);
-        let fills = delta(after.fills, before.fills);
+        let repeated = delta(after.repeated, before.repeated);
         let processed = delta(after.processed, before.processed);
         let pushed = delta(after.pushed, before.pushed);
 
@@ -346,14 +351,14 @@ impl FramePipeline {
 
         let fps_of = |count: u64| count as f64 / seconds.max(0.001);
         log::info!(
-            "录制统计：采集 {:.1} fps（{} 帧，跳过 {} 帧）· 输出 {:.1} fps（{} 帧，其中补帧 {}）· \
+            "录制统计：采集 {:.1} fps（{} 帧，跳过 {} 帧）· 输出 {:.1} fps（{} 帧，其中重复 {}）· \
              单帧处理 {:.1} ms · 编码 {:.1} ms（峰值 {:.1} ms）",
             fps_of(pushed),
             pushed,
             delta(after.skipped_not_due, before.skipped_not_due),
             fps_of(emitted),
             emitted,
-            fills,
+            repeated,
             work_ms,
             encode_ms,
             self.stats.max_encode.as_secs_f64() * 1_000.0,
@@ -361,8 +366,8 @@ impl FramePipeline {
 
         // More than a third of the output being repeats means the pipeline (or
         // the source) cannot sustain the requested frame rate.
-        if emitted > 0 && fills * 3 > emitted {
-            let percent = fills as f64 / emitted as f64 * 100.0;
+        if emitted > 0 && repeated * 3 > emitted {
+            let percent = repeated as f64 / emitted as f64 * 100.0;
             log::warn!(
                 "采集跟不上目标帧率：约 {percent:.0}% 的输出帧是重复帧，画面会像幻灯片。\
                  建议：降低帧率、把输出缩放到 1080p、关闭显示器 HDR，或改用硬件编码器。"
@@ -435,8 +440,14 @@ impl FramePipeline {
         while self.pacer.emitted() < due {
             self.emit(staging, frame_width, frame_height)?;
         }
+        let emitted_now = self.pacer.emitted();
+        if emitted_now > before {
+            // One push can owe several output frames when the timeline fell
+            // behind; everything past the first is a repeat of this frame.
+            self.stats.repeated += emitted_now - before - 1;
+        }
 
-        if self.pacer.emitted() != before {
+        if emitted_now != before {
             // Keep the finished frame for gap filling by *handing over* the
             // buffer instead of copying it again; `staging` gets the previous
             // frame's allocation back and reuses it next time.
@@ -523,7 +534,7 @@ impl FramePipeline {
                 // These pixels already are the remembered frame, so nothing is
                 // copied: the timeline is simply extended with them.
                 self.emit(&duplicate, width, height)?;
-                self.stats.fills += 1;
+                self.stats.repeated += 1;
             }
             Ok(())
         })();
