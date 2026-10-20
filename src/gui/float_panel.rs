@@ -63,6 +63,10 @@ impl FloatPanel {
         // local. The data it draws is copied in for the same reason.
         let stop_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_flag = std::sync::Arc::clone(&stop_requested);
+        // Acting on the session directly matters: while the main window is hidden
+        // the app's own `ui()` may not run at all, so a stop that only queues an
+        // action for the next UI frame appears to do nothing.
+        let session = shared.cloned();
         let shown = snapshot.clone();
         let viewport = egui::ViewportBuilder::default()
             .with_title(TITLE)
@@ -79,6 +83,7 @@ impl FloatPanel {
             egui::ViewportId::from_hash_of("screenrec-float-panel"),
             viewport,
             move |ctx, _class| {
+                let mut woke_main_window = false;
                 egui::CentralPanel::default()
                     .frame(
                         egui::Frame::NONE
@@ -125,11 +130,23 @@ impl FloatPanel {
                                         .clicked()
                                     {
                                         stop_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                        if let Some(session) = &session {
+                                            session.request_stop();
+                                        }
+                                        woke_main_window = true;
                                     }
                                 },
                             );
                         });
                     });
+
+                if woke_main_window {
+                    // Wake the main window so it can finish the bookkeeping
+                    // (history entry, status, UI reset). Without this the stop
+                    // still happens in the session but the window never updates.
+                    ctx.request_repaint();
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
             },
         );
 
@@ -139,7 +156,6 @@ impl FloatPanel {
             self.visible = false;
         }
         self.visible = recording;
-        let _ = shared;
         if stop_requested.load(std::sync::atomic::Ordering::Relaxed) {
             stop_requested.store(false, std::sync::atomic::Ordering::Relaxed);
             Some(FloatAction::Stop)

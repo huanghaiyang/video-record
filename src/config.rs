@@ -36,11 +36,38 @@ pub fn app_data_dir() -> PathBuf {
         }
     }
 
-    dirs::config_dir()
+    // Written to a location the user cannot write to (virtualized profile,
+    // roaming redirection, restrictive sandbox) silently breaks config/history
+    // persistence, so fall back to another per-user place that does work.
+    let preferred = dirs::config_dir()
         .or_else(dirs::data_dir)
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("ScreenRec")
+        .join("ScreenRec");
+    let chosen = std::sync::OnceLock::get_or_init(&DATA_DIR_CACHE, || {
+        let mut candidates = vec![preferred];
+        if let Some(local) = dirs::data_local_dir() {
+            candidates.push(local.join("ScreenRec"));
+        }
+        candidates.push(std::env::temp_dir().join("ScreenRec"));
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                candidates.push(dir.join("ScreenRecData"));
+            }
+        }
+
+        for candidate in &candidates {
+            if crate::paths::is_writable(candidate).is_ok() {
+                return candidate.clone();
+            }
+        }
+        // Nothing worked: hand back the first so errors stay meaningful.
+        candidates.remove(0)
+    });
+    chosen.clone()
 }
+
+/// Resolved once, so a fallback does not move the data around mid-run.
+static DATA_DIR_CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 pub fn config_path() -> PathBuf {
     app_data_dir().join("config.json")

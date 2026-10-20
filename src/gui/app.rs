@@ -109,6 +109,11 @@ pub struct ScreenRecApp {
     tray: Option<super::tray::TrayHandle>,
     /// Floating control bar shown while recording, excluded from capture.
     float_panel: super::float_panel::FloatPanel,
+    /// Why the tray could not be created, shown in the self-check panel.
+    tray_error: Option<String>,
+    /// 水印画板：当前贴图与它的签名（外观变了才重建）。
+    watermark_preview: Option<egui::TextureHandle>,
+    watermark_preview_key: u64,
 }
 
 impl ScreenRecApp {
@@ -154,6 +159,9 @@ impl ScreenRecApp {
             region_corner: None,
             tray: None,
             float_panel: super::float_panel::FloatPanel::new(),
+            tray_error: None,
+            watermark_preview: None,
+            watermark_preview_key: 0,
         };
 
         // The tray is what makes "exit" reachable while the window is hidden, so
@@ -163,7 +171,10 @@ impl ScreenRecApp {
                 log::info!("系统托盘已创建");
                 app.tray = Some(tray);
             }
-            Err(err) => log::warn!("系统托盘创建失败（其余功能不受影响）：{err}"),
+            Err(err) => {
+                log::warn!("系统托盘创建失败（其余功能不受影响）：{err}");
+                app.tray_error = Some(err.to_string());
+            }
         }
 
         app.refresh_sources();
@@ -1530,11 +1541,137 @@ impl ScreenRecApp {
             if changed {
                 self.touch_config();
             }
+            if self.config.watermark.enabled {
+                ui.add_space(6.0);
+                self.watermark_preview(ui);
+            }
+
             hint(
                 ui,
                 "水印在缩放之后叠加到输出画面；运动与平铺都是时间的纯函数，暂停恢复不会跳变。",
             );
         });
+    }
+
+    /// 水印画板：把水印按真实比例合成到一块示意画面上，边调参数边看效果。
+    fn watermark_preview(&mut self, ui: &mut egui::Ui) {
+        use std::hash::{Hash, Hasher};
+
+        use crate::watermark;
+
+        // 画板宽度跟随可用宽度，高度固定 16:9。
+        let canvas_width = (ui.available_width() - 8.0).clamp(240.0, 520.0);
+        let canvas_width = canvas_width.round() as u32;
+        let canvas_height = (canvas_width as f32 * 9.0 / 16.0).round() as u32;
+
+        // 代表比例：用当前输出尺寸换算，这样 4K 下的小字在画板上也能看出相对大小。
+        let (out_width, out_height) = self.expected_output_size();
+        let ratio = canvas_width as f32 / out_width.max(1) as f32;
+
+        let mut shown = self.config.watermark.clone();
+        shown.font_size = ((shown.font_size as f32 * ratio).round() as u32).max(6);
+        shown.margin = ((shown.margin as f32 * ratio).round() as i32).max(0);
+        shown.speed *= ratio;
+
+        // 贴图只和外观有关；运动/位置每帧重算，所以这里只缓存贴图。
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        shown.text.hash(&mut hasher);
+        shown.pattern.id().hash(&mut hasher);
+        shown.font_size.hash(&mut hasher);
+        shown.color.hash(&mut hasher);
+        // opacity 被烘焙进贴图，所以也算外观。
+        shown.opacity.to_bits().hash(&mut hasher);
+        shown.anchor.id().hash(&mut hasher);
+        shown.repeat.id().hash(&mut hasher);
+        shown.motion.id().hash(&mut hasher);
+        let key = hasher.finish();
+
+        let sprite = match watermark::render_sprite(&shown) {
+            Ok(sprite) => sprite,
+            Err(err) => {
+                hint(ui, format!("画板：{err}"));
+                return;
+            }
+        };
+
+        // 背景：深色渐变 + 网格，便于判断对比度。
+        let mut canvas = vec![0u8; (canvas_width * canvas_height * 4) as usize];
+        for y in 0..canvas_height {
+            let t = y as f32 / canvas_height.max(1) as f32;
+            let shade = (42.0 - 22.0 * t) as u8;
+            for x in 0..canvas_width {
+                let offset = ((y * canvas_width + x) * 4) as usize;
+                let grid = x % 48 == 0 || y % 48 == 0;
+                let value = if grid { shade.saturating_add(10) } else { shade };
+                canvas[offset] = value;
+                canvas[offset + 1] = value.saturating_add(4);
+                canvas[offset + 2] = value.saturating_add(9);
+                canvas[offset + 3] = 255;
+            }
+        }
+
+        // 用界面的运行时间驱动动画，和录制时的 elapsed 语义一致。
+        let elapsed = std::time::Duration::from_secs_f64(ui.input(|input| input.time));
+        if let Err(err) =
+            watermark::composite(&mut canvas, canvas_width, canvas_height, &sprite, &shown, elapsed)
+        {
+            hint(ui, format!("画板合成失败：{err}"));
+            return;
+        }
+
+        if shown.motion != crate::watermark::WatermarkMotion::None {
+            // 运动的水印要持续重绘，否则画板是静止的。
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        let mut rgba = canvas;
+        crate::encode::util::bgra_to_rgba_in_place(&mut rgba);
+        let image = egui::ColorImage::from_rgba_unmultiplied(
+            [canvas_width as usize, canvas_height as usize],
+            &rgba,
+        );
+        let size = egui::vec2(canvas_width as f32, canvas_height as f32);
+        match self.watermark_preview.as_mut() {
+            Some(texture) if self.watermark_preview_key == key => texture.set(image, egui::TextureOptions::LINEAR),
+            Some(texture) => {
+                texture.set(image, egui::TextureOptions::LINEAR);
+                self.watermark_preview_key = key;
+            }
+            None => {
+                self.watermark_preview =
+                    Some(ui.ctx().load_texture("wm-preview", image, egui::TextureOptions::LINEAR));
+                self.watermark_preview_key = key;
+            }
+        }
+
+        if let Some(texture) = &self.watermark_preview {
+            ui.add(egui::Image::new((texture.id(), size)).corner_radius(6));
+        }
+        hint(
+            ui,
+            format!(
+                "画板（{}×{} 输出比例 {:.0}%）：实际录制时水印按同样比例叠加。",
+                out_width,
+                out_height,
+                ratio * 100.0
+            ),
+        );
+    }
+
+    /// 当前设置下预期的输出分辨率（缩放后）。
+    fn expected_output_size(&self) -> (u32, u32) {
+        let (source_width, source_height) = self
+            .snapshot
+            .output_size
+            .or(self.snapshot.source_size)
+            .or_else(|| self.current_source_size())
+            .unwrap_or((1920, 1080));
+        crate::formats::plan_size(
+            self.config.container,
+            self.config.scale,
+            source_width.max(2),
+            source_height.max(2),
+        )
     }
 
     fn output_card(&mut self, ui: &mut egui::Ui) {
@@ -2138,9 +2275,10 @@ impl ScreenRecApp {
             key_value(
                 ui,
                 "系统托盘",
-                match self.tray.is_some() {
-                    true => "已创建",
-                    false => "不可用（任务栏/资源管理器未运行？其余功能不受影响）",
+                match (&self.tray, &self.tray_error) {
+                    (Some(_), _) => "已创建".to_string(),
+                    (None, Some(reason)) => format!("不可用：{reason}"),
+                    (None, None) => "未创建".to_string(),
                 },
             );
 
@@ -2182,12 +2320,21 @@ impl ScreenRecApp {
             );
 
             match &self.capabilities {
+                Some(map) if map.total() == 0 => {
+                    key_value(ui, "编码器", "未知（探测未运行或结果为空，不影响录制）");
+                    if let Some(reason) = map.probe_error() {
+                        hint(ui, reason);
+                    }
+                }
                 Some(map) => {
                     key_value(
                         ui,
                         "编码器",
                         format!("{}/{} 组合可用", map.supported_count(), map.total()),
                     );
+                    if let Some(reason) = map.probe_error() {
+                        hint(ui, format!("探测目录不可写：{reason}"));
+                    }
                     // Only the failures are interesting; the supported ones are
                     // listed in the table below.
                     let mut failures: Vec<String> = map

@@ -23,9 +23,17 @@ pub type CapabilityResult = Result<u64, String>;
 #[derive(Debug, Clone, Default)]
 pub struct CapabilityMap {
     results: HashMap<(Container, VideoCodec), CapabilityResult>,
+    /// Set when the probe could not run at all (typically an unwritable temp
+    /// directory). The UI then shows "未知" instead of claiming 0/0.
+    probe_error: Option<String>,
 }
 
 impl CapabilityMap {
+    /// Why the probe could not run, when it could not.
+    pub fn probe_error(&self) -> Option<&str> {
+        self.probe_error.as_deref()
+    }
+
     /// `None` when the combination was not probed (for example FFmpeg-only).
     pub fn is_supported(&self, container: Container, codec: VideoCodec) -> Option<bool> {
         self.results.get(&(container, codec)).map(Result::is_ok)
@@ -77,7 +85,12 @@ impl CapabilityMap {
 /// order of a second on a healthy machine and fails fast where a transform is
 /// missing.
 pub fn probe_all() -> CapabilityMap {
-    let dir = std::env::temp_dir().join(format!("screenrec-capability-{}", std::process::id()));
+    let mut dir = std::env::temp_dir().join(format!("screenrec-capability-{}", std::process::id()));
+    if std::fs::create_dir_all(&dir).is_err() {
+        // Temp not writable (sandboxed or locked-down profile): probe next to the
+        // per-user data directory instead.
+        dir = crate::config::app_data_dir().join("capability-probe");
+    }
     let map = probe_into(&dir);
     let _ = std::fs::remove_dir_all(&dir);
     map
@@ -87,9 +100,10 @@ pub fn probe_all() -> CapabilityMap {
 pub fn probe_into(dir: &std::path::Path) -> CapabilityMap {
     let mut results = HashMap::new();
 
+    let mut write_error = None;
     if let Err(err) = std::fs::create_dir_all(dir) {
         log::warn!("无法创建编码器检测目录 {}: {err}", dir.display());
-        return CapabilityMap { results };
+        write_error = Some(format!("无法创建检测目录 {}：{err}", dir.display()));
     }
 
     for container in Container::ALL {
@@ -122,7 +136,10 @@ pub fn probe_into(dir: &std::path::Path) -> CapabilityMap {
         }
     }
 
-    CapabilityMap { results }
+    CapabilityMap {
+        results,
+        probe_error: write_error,
+    }
 }
 
 /// Writes two frames through the real sink and reports the resulting size.
@@ -240,7 +257,10 @@ mod tests {
         let mut results = HashMap::new();
         results.insert((Container::Mp4, VideoCodec::H264), Ok(1024));
         results.insert((Container::Mp4, VideoCodec::Hevc), Err("缺少解码器".to_string()));
-        let map = CapabilityMap { results };
+        let map = CapabilityMap {
+        results,
+        probe_error: None,
+    };
 
         assert_eq!(map.is_supported(Container::Mp4, VideoCodec::H264), Some(true));
         assert_eq!(map.bytes(Container::Mp4, VideoCodec::H264), Some(1024));
@@ -256,7 +276,10 @@ mod tests {
         let mut results = HashMap::new();
         results.insert((Container::Wmv, VideoCodec::Wmv3), Ok(1));
         results.insert((Container::Mp4, VideoCodec::H264), Ok(1));
-        let map = CapabilityMap { results };
+        let map = CapabilityMap {
+        results,
+        probe_error: None,
+    };
         let ids: Vec<String> = map
             .entries()
             .into_iter()
