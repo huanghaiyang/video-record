@@ -52,6 +52,9 @@ pub fn audio_subtype(codec: AudioCodec) -> anyhow::Result<AudioSettingsSubType> 
 
 pub struct NativeVideoSink {
     encoder: Option<VideoEncoder>,
+    /// Where Media Foundation actually writes (a scratch file, see [`Self::create_at`]).
+    scratch: PathBuf,
+    /// Final path the caller asked for; the scratch file is moved here on finish.
     path: PathBuf,
     label: String,
     audio: Option<AudioParams>,
@@ -72,11 +75,53 @@ impl NativeVideoSink {
         Self::create(container, codec, params, path)
     }
 
-    /// Creates a sink writing to an explicit path (used by the format probe).
+    /// Creates a sink whose finished file ends up at `path`.
+    ///
+    /// Media Foundation's `StorageFile` based writer refuses some perfectly
+    /// writable locations (`0x80070005`, "not in an accessible location"), so the
+    /// destination is tried first and, when that fails, the encoder writes a
+    /// **scratch file** in a known-good directory and [`FrameSink::finish`] moves
+    /// the result over. The direct attempt keeps the common case free of an extra
+    /// file copy (which matters when the target is on another volume).
     pub fn create(
         container: Container,
         codec: VideoCodec,
         params: SinkParams,
+        path: PathBuf,
+    ) -> anyhow::Result<Self> {
+        match Self::create_at(container, codec, params.clone(), path.clone(), path.clone()) {
+            Ok(sink) => Ok(sink),
+            Err(direct_error) => {
+                // A half-created file would confuse the retry and the caller.
+                let _ = std::fs::remove_file(&path);
+                log::warn!(
+                    "无法直接写入 {}（{direct_error}），改写到临时目录后再移动",
+                    path.display()
+                );
+
+                let extension = container.extension();
+                let scratch = crate::paths::scratch_dir().join(format!(
+                    "screenrec-{}-{}.{extension}",
+                    std::process::id(),
+                    crate::paths::timestamp_now().replace([':', '.', ' '], "-")
+                ));
+                Self::create_at(container, codec, params, scratch, path.clone()).map_err(
+                    |scratch_error| {
+                        anyhow::anyhow!(
+                            "无法创建视频文件：{direct_error}；改用临时目录也失败：{scratch_error}"
+                        )
+                    },
+                )
+            }
+        }
+    }
+
+    /// Creates a sink writing to `scratch`, to be moved to `path` on finish.
+    fn create_at(
+        container: Container,
+        codec: VideoCodec,
+        params: SinkParams,
+        scratch: PathBuf,
         path: PathBuf,
     ) -> anyhow::Result<Self> {
         let video_settings = VideoSettingsBuilder::new(params.width, params.height)
@@ -97,7 +142,12 @@ impl NativeVideoSink {
         let container_settings =
             ContainerSettingsBuilder::new().sub_type(container_subtype(container)?);
 
-        let encoder = VideoEncoder::new(video_settings, audio_settings, container_settings, &path)
+        if let Some(parent) = scratch.parent() {
+            std::fs::create_dir_all(parent).map_err(|err| {
+                anyhow::anyhow!("无法创建编码临时目录 {}：{err}", parent.display())
+            })?;
+        }
+        let encoder = VideoEncoder::new(video_settings, audio_settings, container_settings, &scratch)
             .map_err(|err| encoder_creation_error(&path, &err.to_string()))?;
         log::info!(
             "内置编码器已启动: {} · {} · {}x{}@{} · {} bps",
@@ -111,6 +161,7 @@ impl NativeVideoSink {
 
         Ok(Self {
             encoder: Some(encoder),
+            scratch,
             path,
             label: format!("内置编码器 {}", codec.id().to_uppercase()),
             audio: params.audio,
@@ -189,7 +240,25 @@ impl FrameSink for NativeVideoSink {
         if let Some(encoder) = self.encoder.take() {
             encoder.finish()?;
         }
-        verify_output(&self.path)?;
+
+        // Media Foundation wrote a scratch file; publish it where the user asked.
+        let result = verify_output(&self.scratch)
+            .and_then(|_| {
+                crate::paths::move_file(&self.scratch, &self.path).map_err(|err| {
+                    anyhow::anyhow!(
+                        "录制已完成，但无法把文件移动到 {}：{err}（临时文件：{}）",
+                        self.path.display(),
+                        self.scratch.display()
+                    )
+                })
+            })
+            .and_then(|_| verify_output(&self.path));
+
+        if result.is_err() {
+            // Do not leave a stray scratch file behind on failure.
+            let _ = std::fs::remove_file(&self.scratch);
+        }
+        result?;
         Ok(self.path.clone())
     }
 

@@ -202,6 +202,55 @@ pub fn reveal_in_file_manager(path: &Path) -> std::io::Result<()> {
 ///
 /// Creating a directory is not enough: a folder can exist yet be read-only, or
 /// sit on a share that refuses new files.
+/// A writable directory for intermediate files.
+///
+/// Media Foundation's `StorageFile`/`MediaTranscoder` path refuses some
+/// otherwise-writable locations (drive roots, redirected folders, sandboxed
+/// trees) with `0x80070005`, so the built-in encoder writes into this directory
+/// first and the result is moved to the requested folder afterwards.
+pub fn scratch_dir() -> PathBuf {
+    let mut candidates = vec![std::env::temp_dir().join("ScreenRec")];
+    candidates.push(crate::config::app_data_dir().join("scratch"));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("ScreenRecScratch"));
+        }
+    }
+    candidates.push(std::env::temp_dir());
+
+    for candidate in &candidates {
+        if is_writable(candidate).is_ok() {
+            return candidate.clone();
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Moves a finished file to its final location.
+///
+/// A rename is instant on the same volume; across volumes the bytes are copied
+/// and the source removed. An existing destination is replaced.
+#[cfg(windows)]
+pub fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    if from == to {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(to);
+
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Different volume (or a sharing violation): copy then delete.
+            std::fs::copy(from, to)?;
+            std::fs::remove_file(from)?;
+            Ok(())
+        }
+    }
+}
+
 pub fn is_writable(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|err| err.to_string())?;
 
