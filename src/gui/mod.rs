@@ -1,7 +1,9 @@
 //! Desktop application (egui/eframe).
 
 pub mod app;
+pub mod float_panel;
 pub mod theme;
+pub mod tray;
 pub mod widgets;
 
 pub use app::ScreenRecApp;

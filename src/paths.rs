@@ -292,6 +292,29 @@ pub fn timestamp_now() -> String {
     Local::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// Makes a window invisible to screen capture.
+///
+/// `WDA_EXCLUDEFROMCAPTURE` (Windows 10 2004 and later) removes the window from
+/// Windows Graphics Capture and Desktop Duplication output entirely. Older builds
+/// fall back to `WDA_MONITOR`, where the window is captured as a black rectangle
+/// instead of leaking its contents into the recording.
+#[cfg(windows)]
+pub fn exclude_from_capture(hwnd: windows::Win32::Foundation::HWND) -> anyhow::Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_MONITOR,
+    };
+
+    // SAFETY: `hwnd` comes from `FindWindowW`/`GetHwnd` of a live window.
+    unsafe {
+        if SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).is_ok() {
+            return Ok(());
+        }
+        SetWindowDisplayAffinity(hwnd, WDA_MONITOR)
+            .map_err(|err| anyhow::anyhow!("SetWindowDisplayAffinity 失败：{err}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

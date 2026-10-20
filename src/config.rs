@@ -148,6 +148,8 @@ pub struct AppConfig {
     /// Extra width ceiling for the output; 0 disables it.
     pub max_output_width: u32,
     pub prefer_hardware_encoder: bool,
+    /// 录制时叠加的水印（文字/图案、运动、平铺）。
+    pub watermark: crate::watermark::WatermarkSettings,
 
     // ---- audio ----
     pub audio: AudioConfig,
@@ -203,6 +205,7 @@ impl Default for AppConfig {
             scale: ScaleOption::Original,
             max_output_width: 0,
             prefer_hardware_encoder: false,
+            watermark: crate::watermark::WatermarkSettings::default(),
             audio: AudioConfig::default(),
             capture_cursor: true,
             capture_border: false,
@@ -264,6 +267,21 @@ impl AppConfig {
 
     /// Clamps user input into ranges the rest of the program can rely on.
     pub fn normalize(&mut self) {
+        {
+            let watermark = &mut self.watermark;
+            watermark.font_size = watermark.font_size.clamp(8, 512);
+            watermark.opacity = if watermark.opacity.is_finite() {
+                watermark.opacity.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            watermark.speed = if watermark.speed.is_finite() {
+                watermark.speed.clamp(0.0, 2000.0)
+            } else {
+                0.0
+            };
+            watermark.margin = watermark.margin.clamp(0, 1000);
+        }
         self.schema_version = SCHEMA_VERSION;
         self.frame_rate = self.frame_rate.clamp(1, 240);
         self.countdown_seconds = self.countdown_seconds.min(60);

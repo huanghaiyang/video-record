@@ -55,6 +55,16 @@ pub struct FramePipeline {
     failure: Option<String>,
     finished: bool,
     stats: Stats,
+    /// 已渲染好的水印，录制期间复用；`None` 表示不加水印。
+    watermark: Option<WatermarkLayer>,
+}
+
+/// 水印设置加一次渲染好的贴图。
+///
+/// 贴图只在开始时渲染一次（文字走 GDI），每帧只做小面积的 alpha 混合。
+struct WatermarkLayer {
+    settings: crate::watermark::WatermarkSettings,
+    sprite: crate::watermark::WatermarkSprite,
 }
 
 /// Per-frame counters, reported periodically so a stuttering recording can be
@@ -145,11 +155,41 @@ impl FramePipeline {
             failure: None,
             finished: false,
             stats: Stats::default(),
+            watermark: None,
         }
     }
 
     pub fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// Sets the watermark drawn onto every output frame.
+    ///
+    /// The sprite is rendered here, once, so a GDI failure only disables the
+    /// watermark instead of failing the recording.
+    pub fn set_watermark(&mut self, settings: Option<crate::watermark::WatermarkSettings>) {
+        let Some(settings) = settings.filter(|settings| settings.enabled) else {
+            self.watermark = None;
+            return;
+        };
+        match crate::watermark::render_sprite(&settings) {
+            Ok(sprite) => {
+                log::info!(
+                    "水印已启用：{}×{} 贴图，{}，{} / {} / {}",
+                    sprite.width(),
+                    sprite.height(),
+                    settings.pattern.label(),
+                    settings.anchor.label(),
+                    settings.motion.label(),
+                    settings.repeat.label()
+                );
+                self.watermark = Some(WatermarkLayer { settings, sprite });
+            }
+            Err(err) => {
+                log::warn!("水印渲染失败，本次录制不加水印：{err}");
+                self.watermark = None;
+            }
+        }
     }
 
     /// Records only this part of every captured frame.
@@ -402,11 +442,16 @@ impl FramePipeline {
         // Produce the final output-sized frame in the order the sink wants.
         // When the sink needs bottom-up rows (Media Foundation) the flip is fused
         // into this copy instead of costing a second full-frame pass.
-        let bottom_up = self
-            .sink
-            .as_ref()
-            .map(|sink| sink.row_order() == RowOrder::BottomUp)
-            .unwrap_or(false);
+        // The watermark is drawn in top-down coordinates, so a frame that still
+        // needs compositing cannot take the fused flip: it is produced top-down
+        // and the sink flips it afterwards.
+        let watermark_active = self.watermark.is_some();
+        let bottom_up = !watermark_active
+            && self
+                .sink
+                .as_ref()
+                .map(|sink| sink.row_order() == RowOrder::BottomUp)
+                .unwrap_or(false);
         if width == self.dst_width && height == self.dst_height {
             if bottom_up {
                 util::flip_vertical(pixels, width, height, staging);
@@ -435,6 +480,22 @@ impl FramePipeline {
 
         let frame_width = self.dst_width;
         let frame_height = self.dst_height;
+
+        // Composite before emitting so filler frames carry the watermark too.
+        if let Some(layer) = self.watermark.as_ref() {
+            let elapsed = self.pacer.elapsed();
+            if let Err(err) = crate::watermark::composite(
+                staging,
+                frame_width,
+                frame_height,
+                &layer.sprite,
+                &layer.settings,
+                elapsed,
+            ) {
+                log::warn!("水印合成失败，已跳过本帧水印：{err}");
+            }
+        }
+
         let due = self.pacer.frames_due(self.pacer.elapsed());
         let before = self.pacer.emitted();
         while self.pacer.emitted() < due {

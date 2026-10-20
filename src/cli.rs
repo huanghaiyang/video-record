@@ -105,6 +105,42 @@ pub struct RecordArgs {
     #[arg(long)]
     pub max_width: Option<u32>,
 
+    /// 水印文字（支持中文）；与 --watermark-pattern 可同时使用
+    #[arg(long)]
+    pub watermark_text: Option<String>,
+
+    /// 水印基础图案：none / dots / grid / logo
+    #[arg(long)]
+    pub watermark_pattern: Option<String>,
+
+    /// 水印运动：none / scroll-left / scroll-right / scroll-up / scroll-down / diagonal / bounce
+    #[arg(long)]
+    pub watermark_motion: Option<String>,
+
+    /// 水印重复：off / tile / ticker
+    #[arg(long)]
+    pub watermark_repeat: Option<String>,
+
+    /// 水印不透明度 0..1
+    #[arg(long)]
+    pub watermark_opacity: Option<f32>,
+
+    /// 水印字号（像素）
+    #[arg(long)]
+    pub watermark_size: Option<u32>,
+
+    /// 水印颜色，RRGGBB
+    #[arg(long)]
+    pub watermark_color: Option<String>,
+
+    /// 水印静态位置：top-left / top-right / bottom-left / bottom-right / center
+    #[arg(long)]
+    pub watermark_anchor: Option<String>,
+
+    /// 水印移动速度（像素/秒）
+    #[arg(long)]
+    pub watermark_speed: Option<f32>,
+
     /// 不录制鼠标指针
     #[arg(long)]
     pub no_cursor: bool,
@@ -393,6 +429,63 @@ fn record(args: RecordArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Applies the watermark flags; any of them enables the watermark.
+fn apply_watermark(
+    watermark: &mut crate::watermark::WatermarkSettings,
+    args: &RecordArgs,
+) -> anyhow::Result<()> {
+    use crate::watermark::{WatermarkAnchor, WatermarkMotion, WatermarkPattern, WatermarkRepeat};
+
+    if let Some(text) = &args.watermark_text {
+        watermark.text = text.clone();
+        watermark.enabled = true;
+    }
+    if let Some(pattern) = &args.watermark_pattern {
+        watermark.pattern = WatermarkPattern::from_id(pattern)
+            .ok_or_else(|| anyhow::anyhow!("未知的水印图案：{pattern}"))?;
+        watermark.enabled = true;
+    }
+    if let Some(motion) = &args.watermark_motion {
+        watermark.motion = WatermarkMotion::from_id(motion)
+            .ok_or_else(|| anyhow::anyhow!("未知的水印运动：{motion}"))?;
+        watermark.enabled = true;
+    }
+    if let Some(repeat) = &args.watermark_repeat {
+        watermark.repeat = WatermarkRepeat::from_id(repeat)
+            .ok_or_else(|| anyhow::anyhow!("未知的水印重复方式：{repeat}"))?;
+        watermark.enabled = true;
+    }
+    if let Some(opacity) = args.watermark_opacity {
+        watermark.opacity = opacity.clamp(0.0, 1.0);
+        watermark.enabled = true;
+    }
+    if let Some(size) = args.watermark_size {
+        watermark.font_size = size.clamp(8, 512);
+        watermark.enabled = true;
+    }
+    if let Some(colour) = &args.watermark_color {
+        let cleaned = colour.trim_start_matches('#');
+        let value = u32::from_str_radix(cleaned, 16)
+            .map_err(|_| anyhow::anyhow!("水印颜色需要是 RRGGBB：{colour}"))?;
+        watermark.color = [
+            ((value >> 16) & 0xFF) as u8,
+            ((value >> 8) & 0xFF) as u8,
+            (value & 0xFF) as u8,
+        ];
+        watermark.enabled = true;
+    }
+    if let Some(anchor) = &args.watermark_anchor {
+        watermark.anchor = WatermarkAnchor::from_id(anchor)
+            .ok_or_else(|| anyhow::anyhow!("未知的水印位置：{anchor}"))?;
+        watermark.enabled = true;
+    }
+    if let Some(speed) = args.watermark_speed {
+        watermark.speed = speed.clamp(0.0, 2000.0);
+        watermark.enabled = true;
+    }
+    Ok(())
+}
+
 fn apply_overrides(config: &mut AppConfig, args: &RecordArgs) -> anyhow::Result<()> {
     if let Some(format) = &args.format {
         config.container = Container::from_id(format)
@@ -427,6 +520,7 @@ fn apply_overrides(config: &mut AppConfig, args: &RecordArgs) -> anyhow::Result<
     if let Some(width) = args.max_width {
         config.max_output_width = width;
     }
+    apply_watermark(&mut config.watermark, args)?;
     if args.no_cursor {
         config.capture_cursor = false;
     }
@@ -1043,6 +1137,15 @@ mod tests {
             region: Some("100,200,640,480".into()),
             test_pattern: false,
             json: false,
+            watermark_text: None,
+            watermark_pattern: None,
+            watermark_motion: None,
+            watermark_repeat: None,
+            watermark_opacity: None,
+            watermark_size: None,
+            watermark_color: None,
+            watermark_anchor: None,
+            watermark_speed: None,
         };
         apply_overrides(&mut config, &args).unwrap();
         assert_eq!(config.container, Container::Gif);
@@ -1085,6 +1188,15 @@ mod tests {
             region: None,
             test_pattern: false,
             json: false,
+            watermark_text: None,
+            watermark_pattern: None,
+            watermark_motion: None,
+            watermark_repeat: None,
+            watermark_opacity: None,
+            watermark_size: None,
+            watermark_color: None,
+            watermark_anchor: None,
+            watermark_speed: None,
         };
         assert!(apply_overrides(&mut config, &args).is_err());
     }
@@ -1118,6 +1230,15 @@ mod tests {
             region: Some("800x600+100+200".into()),
             test_pattern: false,
             json: false,
+            watermark_text: None,
+            watermark_pattern: None,
+            watermark_motion: None,
+            watermark_repeat: None,
+            watermark_opacity: None,
+            watermark_size: None,
+            watermark_color: None,
+            watermark_anchor: None,
+            watermark_speed: None,
         };
         apply_overrides(&mut config, &args).unwrap();
         assert_eq!(config.region, Some(Region::new(100, 200, 800, 600)));

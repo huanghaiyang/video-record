@@ -103,6 +103,12 @@ pub struct ScreenRecApp {
     region_fields: Region,
     /// First corner picked with "取左上角", in virtual-desktop pixels.
     region_corner: Option<(i32, i32)>,
+
+    /// System tray icon; `None` when it could not be created (the window still
+    /// works, so this is never fatal).
+    tray: Option<super::tray::TrayHandle>,
+    /// Floating control bar shown while recording, excluded from capture.
+    float_panel: super::float_panel::FloatPanel,
 }
 
 impl ScreenRecApp {
@@ -146,7 +152,19 @@ impl ScreenRecApp {
             region_enabled: saved_region.is_some(),
             region_fields: saved_region.unwrap_or(Region::new(0, 0, 640, 360)),
             region_corner: None,
+            tray: None,
+            float_panel: super::float_panel::FloatPanel::new(),
         };
+
+        // The tray is what makes "exit" reachable while the window is hidden, so
+        // it is created before anything else can hide the window.
+        match super::tray::TrayHandle::spawn() {
+            Ok(tray) => {
+                log::info!("系统托盘已创建");
+                app.tray = Some(tray);
+            }
+            Err(err) => log::warn!("系统托盘创建失败（其余功能不受影响）：{err}"),
+        }
 
         app.refresh_sources();
         app.restore_last_source();
@@ -166,6 +184,51 @@ impl ScreenRecApp {
     }
 
     // ------------------------------------------------------------ helpers ----
+
+    /// Handles the menu picks from the system tray.
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray) = self.tray.as_ref() else {
+            return;
+        };
+        tray.set_recording(self.is_recording());
+
+        // Collect first: acting on events needs `&mut self` while `tray` borrows it.
+        let mut events = Vec::new();
+        while let Some(event) = tray.try_recv() {
+            events.push(event);
+        }
+
+        for event in events {
+            match event {
+                super::tray::TrayEvent::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                }
+                super::tray::TrayEvent::Hide => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+                super::tray::TrayEvent::Start => self.request_start(),
+                super::tray::TrayEvent::Stop => self.stop_recording(),
+                super::tray::TrayEvent::Exit => {
+                    // Quitting goes through the normal close path so the
+                    // recording is finalized and the config is saved.
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    /// Draws the floating control bar while a recording is running.
+    fn show_float_panel(&mut self, ctx: &egui::Context) {
+        let shared = self.shared.clone();
+        let snapshot = self.snapshot.clone();
+        if let Some(action) = self.float_panel.show(ctx, &snapshot, shared.as_ref()) {
+            match action {
+                super::float_panel::FloatAction::Stop => self.stop_recording(),
+            }
+        }
+    }
 
     fn is_recording(&self) -> bool {
         self.shared.as_ref().is_some_and(|shared| shared.is_active())
@@ -918,6 +981,7 @@ impl ScreenRecApp {
                 self.preview_card(ui);
                 self.format_card(ui);
                 self.audio_card(ui);
+                self.watermark_card(ui);
                 self.output_card(ui);
             });
     }
@@ -1315,6 +1379,161 @@ impl ScreenRecApp {
                     "系统声音使用 WASAPI 回环；若设备不支持，录制仍会继续但没有声音。",
                 );
             });
+        });
+    }
+
+    /// Watermark controls: text, pattern, motion and repeat mode.
+    fn watermark_card(&mut self, ui: &mut egui::Ui) {
+        use crate::watermark::{
+            WatermarkAnchor, WatermarkMotion, WatermarkPattern, WatermarkRepeat,
+        };
+
+        section(ui, "水印", |ui| {
+            let mut changed = false;
+            changed |= ui
+                .checkbox(&mut self.config.watermark.enabled, "启用水印（写入录制画面）")
+                .changed();
+
+            ui.add_enabled_ui(self.config.watermark.enabled, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("文字");
+                    changed |= ui
+                        .add(
+                            egui::TextEdit::singleline(&mut self.config.watermark.text)
+                                .hint_text("例如：内部资料 请勿外传")
+                                .desired_width(240.0),
+                        )
+                        .changed();
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("图案");
+                    egui::ComboBox::from_id_salt("wm_pattern")
+                        .selected_text(self.config.watermark.pattern.label())
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            for value in WatermarkPattern::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.config.watermark.pattern,
+                                        value,
+                                        value.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+
+                    ui.label("位置");
+                    egui::ComboBox::from_id_salt("wm_anchor")
+                        .selected_text(self.config.watermark.anchor.label())
+                        .width(72.0)
+                        .show_ui(ui, |ui| {
+                            for value in WatermarkAnchor::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.config.watermark.anchor,
+                                        value,
+                                        value.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("运动");
+                    egui::ComboBox::from_id_salt("wm_motion")
+                        .selected_text(self.config.watermark.motion.label())
+                        .width(96.0)
+                        .show_ui(ui, |ui| {
+                            for value in WatermarkMotion::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.config.watermark.motion,
+                                        value,
+                                        value.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+
+                    ui.label("重复");
+                    egui::ComboBox::from_id_salt("wm_repeat")
+                        .selected_text(self.config.watermark.repeat.label())
+                        .width(84.0)
+                        .show_ui(ui, |ui| {
+                            for value in WatermarkRepeat::ALL {
+                                changed |= ui
+                                    .selectable_value(
+                                        &mut self.config.watermark.repeat,
+                                        value,
+                                        value.label(),
+                                    )
+                                    .changed();
+                            }
+                        });
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("字号");
+                    let mut size = self.config.watermark.font_size;
+                    if ui
+                        .add(egui::Slider::new(&mut size, 12..=160).suffix(" px"))
+                        .changed()
+                    {
+                        self.config.watermark.font_size = size;
+                        changed = true;
+                    }
+                    ui.label("不透明度");
+                    let mut opacity = self.config.watermark.opacity;
+                    if ui
+                        .add(egui::Slider::new(&mut opacity, 0.05..=1.0).fixed_decimals(2))
+                        .changed()
+                    {
+                        self.config.watermark.opacity = opacity;
+                        changed = true;
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("颜色");
+                    let mut colour = egui::Color32::from_rgb(
+                        self.config.watermark.color[0],
+                        self.config.watermark.color[1],
+                        self.config.watermark.color[2],
+                    );
+                    if ui.color_edit_button_srgba(&mut colour).changed() {
+                        self.config.watermark.color = [colour.r(), colour.g(), colour.b()];
+                        changed = true;
+                    }
+                    ui.label("速度");
+                    let mut speed = self.config.watermark.speed;
+                    if ui
+                        .add(egui::Slider::new(&mut speed, 4.0..=400.0).suffix(" px/s"))
+                        .changed()
+                    {
+                        self.config.watermark.speed = speed;
+                        changed = true;
+                    }
+                    ui.label("边距");
+                    let mut margin = self.config.watermark.margin;
+                    if ui
+                        .add(egui::Slider::new(&mut margin, 0..=200).suffix(" px"))
+                        .changed()
+                    {
+                        self.config.watermark.margin = margin;
+                        changed = true;
+                    }
+                });
+            });
+
+            if changed {
+                self.touch_config();
+            }
+            hint(
+                ui,
+                "水印在缩放之后叠加到输出画面；运动与平铺都是时间的纯函数，暂停恢复不会跳变。",
+            );
         });
     }
 
@@ -1894,6 +2113,117 @@ impl ScreenRecApp {
             });
     }
 
+    /// Self-check panel: shows the state of everything the recorder depends on,
+    /// with the exact error when something is unavailable.
+    ///
+    /// This exists because "nothing works" reports are otherwise impossible to
+    /// diagnose: the app itself needs no administrator rights, so the cause is
+    /// always one of the paths, the encoders, or the desktop session.
+    fn diagnostics_section(&mut self, ui: &mut egui::Ui) {
+        section(ui, "自检", |ui| {
+            #[cfg(windows)]
+            {
+                let elevated = unsafe { windows::Win32::UI::Shell::IsUserAnAdmin() }.as_bool();
+                key_value(
+                    ui,
+                    "权限",
+                    if elevated {
+                        "管理员（不需要，但也能用）"
+                    } else {
+                        "标准用户（推荐，功能完整）"
+                    },
+                );
+            }
+
+            key_value(
+                ui,
+                "系统托盘",
+                match self.tray.is_some() {
+                    true => "已创建",
+                    false => "不可用（任务栏/资源管理器未运行？其余功能不受影响）",
+                },
+            );
+
+            let data_dir = crate::config::app_data_dir();
+            key_value(
+                ui,
+                "配置目录",
+                match crate::paths::is_writable(&data_dir) {
+                    Ok(()) => format!("{}（可写）", data_dir.display()),
+                    Err(reason) => format!("{}（不可写：{reason}）", data_dir.display()),
+                },
+            );
+
+            let output_dir = self.config.output_dir.clone();
+            key_value(
+                ui,
+                "录制文件夹",
+                match crate::paths::is_writable(&output_dir) {
+                    Ok(()) => format!("{}（可写）", output_dir.display()),
+                    Err(reason) => {
+                        format!("{}（不可写：{reason}，开始时自动换一个）", output_dir.display())
+                    }
+                },
+            );
+
+            key_value(
+                ui,
+                "采集源",
+                format!("{} 个显示器，{} 个窗口", self.monitors.len(), self.windows.len()),
+            );
+
+            key_value(
+                ui,
+                "FFmpeg",
+                match &self.ffmpeg {
+                    Some(info) => format!("{}（MKV/WebM/MOV 可用）", info.path.display()),
+                    None => "未找到（仅内置格式可用）".to_string(),
+                },
+            );
+
+            match &self.capabilities {
+                Some(map) => {
+                    key_value(
+                        ui,
+                        "编码器",
+                        format!("{}/{} 组合可用", map.supported_count(), map.total()),
+                    );
+                    // Only the failures are interesting; the supported ones are
+                    // listed in the table below.
+                    let mut failures: Vec<String> = map
+                        .entries()
+                        .into_iter()
+                        .filter_map(|(container, codec, result)| match result {
+                            Err(reason) => Some(format!(
+                                "{} {}：{reason}",
+                                container.label(),
+                                codec.label()
+                            )),
+                            Ok(_) => None,
+                        })
+                        .collect();
+                    if failures.is_empty() {
+                        hint(ui, "所有组合均可用");
+                    } else {
+                        failures.truncate(4);
+                        for failure in failures {
+                            hint(ui, failure);
+                        }
+                    }
+                }
+                None => {
+                    key_value(ui, "编码器", "检测中…");
+                }
+            }
+
+            hint(
+                ui,
+                "提示：本程序不需要管理员权限。若 Windows 会话是远程桌面（RDP）或没有可用的桌面输出，\
+                 采集会失败；此时上面的采集源为 0。",
+            );
+        });
+    }
+
     fn about_tab(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -1908,6 +2238,8 @@ impl ScreenRecApp {
                         "内置编码器基于 Windows Media Foundation；安装 FFmpeg 后可导出 MKV / WebM / MOV 等更多格式。",
                     );
                 });
+
+                self.diagnostics_section(ui);
 
                 section(ui, "支持的导出格式", |ui| {
                     egui::Grid::new("formats_grid")
@@ -1984,6 +2316,8 @@ impl eframe::App for ScreenRecApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        self.poll_tray(&ctx);
+        self.show_float_panel(&ctx);
 
         egui::Panel::top("header")
             .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 8)))

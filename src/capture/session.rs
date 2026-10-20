@@ -369,6 +369,7 @@ impl Recorder {
             method: config.capture_method,
             test_pattern: config.test_pattern,
             region: config.region,
+            watermark: Some(config.watermark).filter(|watermark| watermark.enabled),
         };
         let source = request.source.clone();
         let thread_shared = Arc::clone(&shared);
@@ -593,6 +594,8 @@ struct CaptureJob {
     test_pattern: bool,
     /// Area to keep from every captured frame.
     region: Option<Region>,
+    /// Watermark composited onto every output frame.
+    watermark: Option<crate::watermark::WatermarkSettings>,
 }
 
 /// Size of the synthetic test pattern.
@@ -609,10 +612,12 @@ fn run_test_pattern(
     audio: Option<AudioMixer>,
     preview: bool,
     region: Option<Region>,
+    watermark: Option<crate::watermark::WatermarkSettings>,
 ) -> anyhow::Result<()> {
     let (width, height) = TEST_PATTERN_SIZE;
     let mut pipeline = FramePipeline::new(factory, Arc::clone(&shared), fps, audio, preview);
     pipeline.set_crop(region);
+    pipeline.set_watermark(watermark);
     let period = Duration::from_micros(1_000_000 / u64::from(fps.max(1)));
     let mut pixels = vec![0u8; (width as usize) * (height as usize) * 4];
 
@@ -696,18 +701,20 @@ fn run_capture(source: SourceSelection, job: CaptureJob) -> anyhow::Result<()> {
         method,
         test_pattern,
         region,
+        watermark,
     } = job;
 
     // A synthetic source keeps the whole pipeline testable without touching the
     // screen: `screenrec record --test-pattern`.
     if test_pattern {
-        return run_test_pattern(factory, shared, fps, audio, preview, region);
+        return run_test_pattern(factory, shared, fps, audio, preview, region, watermark);
     }
 
     let mut pipeline = FramePipeline::new(factory, Arc::clone(&shared), fps, audio, preview);
     // Area recording: the crop is applied to every frame before the encoder
     // sees it, so all backends behave identically.
     pipeline.set_crop(region);
+    pipeline.set_watermark(watermark);
     if let Some(region) = region {
         log::info!("区域录制：{}", region.label());
     }

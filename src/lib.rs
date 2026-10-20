@@ -26,6 +26,7 @@ pub mod logging;
 pub mod paths;
 pub mod region;
 pub mod units;
+pub mod watermark;
 
 pub use capture::sources::WindowInfo;
 
